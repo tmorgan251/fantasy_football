@@ -1,0 +1,3 @@
+league_id,season,error_type,error
+1229261,2024,ConnectionError,"('Connection aborted.', ConnectionResetError(10054, 'An existing connection was forcibly closed by the remote host', None, 10054, None))"
+905606,2024,ConnectionError,"HTTPSConnectionPool(host='lm-api-reads.fantasy.espn.com', port=443): Max retries exceeded with url: /apis/v3/games/ffl/seasons/2024/segments/0/leagues/905606?view=mSettings (Caused by NameResolutionError(""<urllib3.connection.HTTPSConnection object at 0x0000021E451FFA90>: Failed to resolve 'lm-api-reads.fantasy.espn.com' ([Errno 11001] getaddrinfo failed)""))"
