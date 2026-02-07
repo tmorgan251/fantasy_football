@@ -310,8 +310,31 @@ class FantasyDataCollector:
             except: continue
 
 # --- EXECUTION ---
-# if __name__ == "__main__":
+if __name__ == "__main__":
 #     # Add your Cookies here for private leagues
 #     collector = FantasyDataCollector(swid=None, espn_s2=None, verbose=True)
 #     collector.extract_league(1409356, 2024)
+    import os
+    import pandas as pd
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.normpath(os.path.join(script_dir, "../.."))
+
+    league_csv = os.path.join(project_root, "data", "raw", "espn", "targets_10team_ppr1_season_2024.csv")
+    league_ids = pd.read_csv(league_csv)["league_id"].astype(int).tolist()
+
+    collector = FantasyDataCollector(swid=None, espn_s2=None, verbose=False)
+
+    base_dir = collector.data_dir  # this already points to <project_root>/data/raw/espn
+
+    for year in range(2021, 2025):
+        collector.data_dir = os.path.join(base_dir, str(year))
+        os.makedirs(collector.data_dir, exist_ok=True)
+
+        print(f"\n=== YEAR {year} -> writing to {collector.data_dir} ===")
+        for lid in league_ids:
+            print(f"Running league={lid} year={year}")
+            collector.extract_league(lid, year)
+
+    collector.data_dir = base_dir
 
