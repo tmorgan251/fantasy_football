@@ -487,6 +487,15 @@ class DraftValueAnalyzer:
         out = d.merge(pos, on=["League_ID", "Year", "Player_norm"], how="left")
         out = out.merge(pts, on=["League_ID", "Year", "Player_norm"], how="left")
         
+        # Deduplicate after merges (merges can create duplicates if source data has duplicates)
+        # Keep first occurrence of each League_ID/Year/Overall combination
+        before_dedup = len(out)
+        out = out.drop_duplicates(subset=["League_ID", "Year", "Overall"], keep="first")
+        after_dedup = len(out)
+        
+        if before_dedup != after_dedup and self.verbose:
+            print(f"  Dropped {before_dedup - after_dedup:,} duplicate rows after enrichment")
+        
         out["Season_Total_Points"] = pd.to_numeric(out["Season_Total_Points"], errors="coerce").fillna(0.0)
         
         cols = [

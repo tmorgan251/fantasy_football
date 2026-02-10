@@ -256,68 +256,52 @@ class InjuryAnalyzer:
         Baseline = average (actual - projected) points in weeks with no injuries.
         Includes previous year data if available (except for rookies).
         
+        OPTIMIZED: Uses vectorized operations instead of per-player loops.
+        
         Returns:
             DataFrame with columns: player_norm, position, baseline_avg, baseline_std, n_weeks
         """
         if self.verbose:
             print("\nCalculating player baselines (healthy week performance)...")
+            import time
+            start_time = time.time()
         
         if self.injury_df is None:
             self.load_injury_data()
         if self.lineup_df is None:
             self.load_lineup_data()
         
-        # Get all years in lineup data
-        all_years = sorted(self.lineup_df['Year'].unique())
+        # VECTORIZED APPROACH: Merge all at once instead of per-player
+        # Merge lineup with injury data to identify injury weeks
+        merged = self.lineup_df.merge(
+            self.injury_df[['season', 'week', 'player_norm', 'has_injury']],
+            left_on=['Year', 'Week', 'player_norm'],
+            right_on=['season', 'week', 'player_norm'],
+            how='left',
+            suffixes=('', '_injury')
+        )
         
-        # For each player, calculate baseline across all years (including previous years)
-        all_baselines = []
+        # Mark weeks with no injury data as "no injury"
+        merged['has_injury'] = merged['has_injury'].fillna(False)
         
-        for player in self.lineup_df['player_norm'].unique():
-            player_lineups = self.lineup_df[self.lineup_df['player_norm'] == player].copy()
-            player_years = sorted(player_lineups['Year'].unique())
-            
-            # Get injury data for this player across all years
-            player_injuries = self.injury_df[
-                self.injury_df['player_norm'] == player
-            ][['season', 'week', 'has_injury']].copy()
-            
-            # Merge to identify injury weeks for this player
-            player_merged = player_lineups.merge(
-                player_injuries,
-                left_on=['Year', 'Week'],
-                right_on=['season', 'week'],
-                how='left',
-                suffixes=('', '_injury')
-            )
-            
-            # Mark weeks with no injury data as "no injury"
-            player_merged['has_injury'] = player_merged['has_injury'].fillna(False)
-            
-            # Filter to healthy weeks only (across all years)
-            healthy_weeks = player_merged[~player_merged['has_injury']].copy()
-            
-            if len(healthy_weeks) == 0:
-                continue
-            
-            # Calculate baseline across all healthy weeks (including previous years)
-            baseline_avg = healthy_weeks['point_differential'].mean()
-            baseline_std = healthy_weeks['point_differential'].std()
-            n_weeks = len(healthy_weeks)
-            position = healthy_weeks['Position'].iloc[0] if len(healthy_weeks) > 0 else None
-            
-            all_baselines.append({
-                'player_norm': player,
-                'baseline_avg': baseline_avg,
-                'baseline_std': baseline_std if pd.notna(baseline_std) else 0.0,
-                'n_weeks': n_weeks,
-                'position': position
-            })
+        # Filter to healthy weeks only
+        healthy_weeks = merged[~merged['has_injury']].copy()
         
-        baselines = pd.DataFrame(all_baselines)
+        # Group by player and calculate baselines (vectorized - much faster!)
+        baselines = healthy_weeks.groupby('player_norm').agg({
+            'point_differential': ['mean', 'std', 'count'],
+            'Position': 'first'  # Get position from lineup data
+        }).reset_index()
+        
+        # Flatten column names
+        baselines.columns = ['player_norm', 'baseline_avg', 'baseline_std', 'n_weeks', 'position']
+        
+        # Fill NaN std with 0 (only one data point)
+        baselines['baseline_std'] = baselines['baseline_std'].fillna(0.0)
         
         if self.verbose:
-            print(f"  Calculated baselines for {len(baselines):,} players")
+            elapsed = time.time() - start_time
+            print(f"  ✓ Calculated baselines for {len(baselines):,} players in {elapsed:.1f} seconds")
             print(f"  Average baseline: {baselines['baseline_avg'].mean():.2f} points")
             print(f"  Players with 1+ healthy weeks: {(baselines['n_weeks'] >= 1).sum():,}")
             print(f"  Players with 5+ healthy weeks: {(baselines['n_weeks'] >= 5).sum():,}")
@@ -357,13 +341,18 @@ class InjuryAnalyzer:
         merged['injury_status'] = merged['injury_status'].fillna('No Injury')
         merged['injury_type'] = merged['injury_type'].fillna('None')
         
-        # Use position from lineup data (more reliable)
-        # The merge with suffixes creates 'position_injury' from injury_df's 'position' column
-        if 'position_injury' in merged.columns:
-            merged['position'] = merged['Position'].fillna(merged['position_injury'])
-        else:
-            # If position_injury doesn't exist (no matches), just use Position from lineup
+        # Use position from lineup data (more reliable), fallback to injury data position
+        # Note: 'Position' (capital P) is from lineup_df, 'position' (lowercase) is from injury_df
+        # Since they have different capitalization, both columns exist after merge
+        if 'Position' in merged.columns and 'position' in merged.columns:
+            merged['position'] = merged['Position'].fillna(merged['position'])
+        elif 'Position' in merged.columns:
             merged['position'] = merged['Position']
+        elif 'position' in merged.columns:
+            merged['position'] = merged['position']
+        else:
+            # If neither exists, create empty column
+            merged['position'] = None
         
         # Add baseline if available
         if self.player_baselines is None:
@@ -392,6 +381,9 @@ class InjuryAnalyzer:
         """
         Track consecutive weeks with the same injury type and status.
         
+        OPTIMIZED: Uses vectorized operations with groupby instead of per-player loops.
+        Also resets between years to prevent cross-season counting.
+        
         Returns:
             DataFrame with consecutive_injury_weeks column added
         """
@@ -400,49 +392,85 @@ class InjuryAnalyzer:
         
         if self.verbose:
             print("\nTracking consecutive injury weeks...")
+            import time
+            start_time = time.time()
         
         df = self.merged_df.copy()
-        df = df.sort_values(['player_norm', 'Year', 'Week'])
+        df = df.sort_values(['player_norm', 'Year', 'Week']).reset_index(drop=True)
         
         # Initialize consecutive week counter
         df['consecutive_injury_weeks'] = 0
         
-        # Group by player and track consecutive injuries
-        for player in df['player_norm'].unique():
-            player_mask = df['player_norm'] == player
-            player_data = df[player_mask].copy()
+        # OPTIMIZED: Use groupby with apply for vectorized processing
+        # Group by player, league, AND year to track per-league injuries
+        def track_consecutive_group(group):
+            """Track consecutive injuries for a single player-league-year group."""
+            group = group.copy()
+            group = group.sort_values('Week')
+            group['consecutive_injury_weeks'] = 0
             
             consecutive_count = 0
             prev_injury_type = None
             prev_injury_status = None
+            prev_has_injury = False
+            prev_week = None
             
-            for idx in player_data.index:
-                if df.loc[idx, 'has_injury']:
-                    current_type = df.loc[idx, 'injury_type']
-                    current_status = df.loc[idx, 'injury_status']
+            for idx in group.index:
+                current_week = group.loc[idx, 'Week']
+                has_injury = group.loc[idx, 'has_injury']
+                
+                # Reset if there's a gap in weeks (e.g., week 1 then week 3)
+                if prev_week is not None and current_week != prev_week + 1:
+                    consecutive_count = 0
+                    prev_injury_type = None
+                    prev_injury_status = None
+                    prev_has_injury = False
+                
+                if has_injury:
+                    current_type = group.loc[idx, 'injury_type']
+                    current_status = group.loc[idx, 'injury_status']
                     
                     # Check if same injury type AND status as previous week
-                    if (current_type == prev_injury_type and 
+                    if (prev_has_injury and 
+                        current_type == prev_injury_type and 
                         current_status == prev_injury_status and
-                        current_type != 'None'):
+                        current_type != 'None' and
+                        prev_week is not None and
+                        current_week == prev_week + 1):  # Must be consecutive weeks
                         consecutive_count += 1
                     else:
                         # Reset count (new injury or different type/status)
                         consecutive_count = 1
                     
-                    df.loc[idx, 'consecutive_injury_weeks'] = consecutive_count
+                    group.loc[idx, 'consecutive_injury_weeks'] = consecutive_count
                     prev_injury_type = current_type
                     prev_injury_status = current_status
+                    prev_has_injury = True
                 else:
                     # Reset on healthy week
                     consecutive_count = 0
                     prev_injury_type = None
                     prev_injury_status = None
+                    prev_has_injury = False
+                
+                prev_week = current_week
+            
+            return group
+        
+        # Group by player, league, AND year (resets between seasons and leagues)
+        # This prevents counting the same injury across multiple leagues
+        if 'League_ID' in df.columns:
+            df = df.groupby(['player_norm', 'League_ID', 'Year'], group_keys=False).apply(track_consecutive_group).reset_index(drop=True)
+        else:
+            # Fallback if League_ID not available
+            df = df.groupby(['player_norm', 'Year'], group_keys=False).apply(track_consecutive_group).reset_index(drop=True)
         
         if self.verbose:
+            elapsed = time.time() - start_time
             injured_players = df[df['has_injury']]
             if len(injured_players) > 0:
                 max_consecutive = injured_players['consecutive_injury_weeks'].max()
+                print(f"  ✓ Tracked consecutive injuries in {elapsed:.1f} seconds")
                 print(f"  Max consecutive injury weeks: {max_consecutive}")
                 print(f"  Players with 2+ consecutive weeks: {(injured_players['consecutive_injury_weeks'] >= 2).sum():,}")
         
@@ -837,7 +865,7 @@ class InjuryAnalyzer:
         
         ax1.hist(healthy, bins=50, alpha=0.6, label='Healthy', color='green', density=True)
         ax1.hist(injured, bins=50, alpha=0.6, label='Injured', color='red', density=True)
-        ax1.axvline(x=0, color='black', linestyle='--', alpha=0.5)
+        ax1.axvline(x=0, color='black', linestyle=' --', alpha=0.5)
         ax1.set_xlabel('Point Differential (Actual - Projected)', fontsize=11)
         ax1.set_ylabel('Density', fontsize=11)
         ax1.set_title('Overall: Injured vs Healthy', fontsize=12, fontweight='bold')
@@ -908,6 +936,14 @@ class InjuryAnalyzer:
         """
         Run the complete injury analysis pipeline.
         
+        For faster execution, you can call individual steps separately:
+        1. analyzer.load_injury_data()
+        2. analyzer.load_lineup_data()
+        3. analyzer.calculate_player_baselines()
+        4. analyzer.merge_injury_lineup_data()
+        5. analyzer.track_consecutive_injuries()
+        6. agg_stats, individual = analyzer.analyze_injury_impact()
+        
         Args:
             save_results: If True, save results to CSV files
             output_dir: Directory to save results (default: data/preprocessed)
@@ -919,19 +955,33 @@ class InjuryAnalyzer:
             print("\n" + "="*70)
             print("RUNNING FULL INJURY ANALYSIS PIPELINE")
             print("="*70)
+            import time
+            pipeline_start = time.time()
         
-        # Load data
+        # Step 1: Load data
+        if self.verbose:
+            print("\n[Step 1/5] Loading data...")
         self.load_injury_data()
         self.load_lineup_data()
         
-        # Calculate baselines
+        # Step 2: Calculate baselines (now optimized - much faster!)
+        if self.verbose:
+            print("\n[Step 2/5] Calculating player baselines...")
         self.calculate_player_baselines()
         
-        # Merge and track consecutive injuries
+        # Step 3: Merge data
+        if self.verbose:
+            print("\n[Step 3/5] Merging injury and lineup data...")
         self.merge_injury_lineup_data()
+        
+        # Step 4: Track consecutive injuries (now optimized)
+        if self.verbose:
+            print("\n[Step 4/5] Tracking consecutive injury weeks...")
         self.track_consecutive_injuries()
         
-        # Analyze impact
+        # Step 5: Analyze impact
+        if self.verbose:
+            print("\n[Step 5/5] Analyzing injury impact...")
         agg_stats, individual_records = self.analyze_injury_impact()
         
         # Save results if requested
@@ -956,8 +1006,9 @@ class InjuryAnalyzer:
                 print(f"✓ Saved individual records to: {individual_path}")
         
         if self.verbose:
+            pipeline_elapsed = time.time() - pipeline_start
             print("\n" + "="*70)
-            print("ANALYSIS COMPLETE!")
+            print(f"ANALYSIS COMPLETE! (Total time: {pipeline_elapsed/60:.1f} minutes)")
             print("="*70)
         
         return agg_stats, individual_records
