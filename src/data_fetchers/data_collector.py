@@ -70,7 +70,9 @@ class FantasyDataCollector:
         
         # Thread-safe file writing (multiple threads may write simultaneously)
         with self._write_lock:
-            file_exists = os.path.isfile(filepath)
+            # Check file existence inside lock to prevent race condition
+            # where multiple threads all see file doesn't exist and write headers
+            file_exists = os.path.isfile(filepath) and os.path.getsize(filepath) > 0
             # Append mode ('a'): adds to existing file
             # header=not file_exists: only write header if file is new (first write)
             # This prevents duplicate headers when appending

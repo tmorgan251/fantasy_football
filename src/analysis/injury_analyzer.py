@@ -168,9 +168,33 @@ class InjuryAnalyzer:
         if self.verbose:
             print("\nLoading lineup data...")
         
-        # Check if it's a single file or we need to search year directories
+        # Always use year-specific directories (more reliable)
+        # Check if single file path was provided but doesn't have year info
+        use_year_dirs = True
         if os.path.isfile(self.lineup_data_path):
-            lineup_df = pd.read_csv(self.lineup_data_path)
+            # Check if path contains a year
+            path_parts = Path(self.lineup_data_path).parts
+            has_year_in_path = any(
+                part.isdigit() and len(part) == 4 and 2000 <= int(part) <= 2100
+                for part in path_parts
+            )
+            if has_year_in_path:
+                # Single file with year in path - use it
+                use_year_dirs = False
+        
+        if not use_year_dirs and os.path.isfile(self.lineup_data_path):
+            # Single file with year in path
+            lineup_df = pd.read_csv(
+                self.lineup_data_path,
+                on_bad_lines='skip',
+                engine='python'
+            )
+            # Extract year from path
+            path_parts = Path(self.lineup_data_path).parts
+            for part in path_parts:
+                if part.isdigit() and len(part) == 4 and 2000 <= int(part) <= 2100:
+                    lineup_df['Year'] = int(part)
+                    break
         else:
             # Search in year subdirectories
             script_dir = Path(__file__).parent
@@ -181,15 +205,31 @@ class InjuryAnalyzer:
             for year_dir in sorted(base_dir.glob("[0-9][0-9][0-9][0-9]")):
                 lineup_file = year_dir / "lineup_data.csv"
                 if lineup_file.exists():
-                    df = pd.read_csv(lineup_file)
-                    all_lineups.append(df)
-                    if self.verbose:
-                        print(f"  ✓ Loaded {len(df):,} records from {year_dir.name}")
+                    try:
+                        df = pd.read_csv(
+                            lineup_file,
+                            on_bad_lines='skip',  # Skip malformed rows
+                            engine='python'  # More forgiving parser
+                        )
+                        # Add Year column from directory name
+                        year = int(year_dir.name)
+                        df['Year'] = year
+                        all_lineups.append(df)
+                        if self.verbose:
+                            print(f"  ✓ Loaded {len(df):,} records from {year_dir.name}")
+                    except Exception as e:
+                        if self.verbose:
+                            print(f"  ⚠️  Error loading {year_dir.name}: {e}")
+                        continue
             
             if not all_lineups:
                 raise FileNotFoundError(f"No lineup data found in {base_dir}")
             
             lineup_df = pd.concat(all_lineups, ignore_index=True)
+        
+        # Ensure Year column exists
+        if 'Year' not in lineup_df.columns:
+            raise ValueError("Year column not found in lineup data and could not be inferred")
         
         # Normalize player names
         lineup_df['player_norm'] = lineup_df['Player'].apply(
@@ -318,7 +358,12 @@ class InjuryAnalyzer:
         merged['injury_type'] = merged['injury_type'].fillna('None')
         
         # Use position from lineup data (more reliable)
-        merged['position'] = merged['Position'].fillna(merged['position_injury'])
+        # The merge with suffixes creates 'position_injury' from injury_df's 'position' column
+        if 'position_injury' in merged.columns:
+            merged['position'] = merged['Position'].fillna(merged['position_injury'])
+        else:
+            # If position_injury doesn't exist (no matches), just use Position from lineup
+            merged['position'] = merged['Position']
         
         # Add baseline if available
         if self.player_baselines is None:
