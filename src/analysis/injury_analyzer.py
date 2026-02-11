@@ -27,7 +27,7 @@ class InjuryAnalyzer:
     - Matches injuries to lineup data by player name and week
     - Calculates point differentials (actual - projected) for injured vs healthy players
     - Tracks consecutive injury weeks with same type and status
-    - Generates visualizations (heatmaps, recovery timelines, distributions)
+    - Generates visualizations (heatmaps, distributions)
     """
     
     def __init__(
@@ -251,15 +251,15 @@ class InjuryAnalyzer:
     
     def calculate_player_baselines(self) -> pd.DataFrame:
         """
-        Calculate baseline point differentials for each player.
+        Calculate each player's baseline performance (healthy weeks only).
         
-        Baseline = average (actual - projected) points in weeks with no injuries.
-        Includes previous year data if available (except for rookies).
+        Baseline = average (actual - projected) points when player has no injury.
+        Used to compare injured performance against their normal healthy performance.
         
-        OPTIMIZED: Uses vectorized operations instead of per-player loops.
+        Uses vectorized groupby operations instead of slow per-player loops.
         
         Returns:
-            DataFrame with columns: player_norm, position, baseline_avg, baseline_std, n_weeks
+            DataFrame: player_norm, position, baseline_avg, baseline_std, n_weeks
         """
         if self.verbose:
             print("\nCalculating player baselines (healthy week performance)...")
@@ -271,8 +271,7 @@ class InjuryAnalyzer:
         if self.lineup_df is None:
             self.load_lineup_data()
         
-        # VECTORIZED APPROACH: Merge all at once instead of per-player
-        # Merge lineup with injury data to identify injury weeks
+        # Merge lineup and injury data to identify which weeks had injuries
         merged = self.lineup_df.merge(
             self.injury_df[['season', 'week', 'player_norm', 'has_injury']],
             left_on=['Year', 'Week', 'player_norm'],
@@ -281,23 +280,20 @@ class InjuryAnalyzer:
             suffixes=('', '_injury')
         )
         
-        # Mark weeks with no injury data as "no injury"
+        # Weeks without injury data are treated as healthy
         merged['has_injury'] = merged['has_injury'].fillna(False)
         
-        # Filter to healthy weeks only
+        # Only use healthy weeks to calculate baseline
         healthy_weeks = merged[~merged['has_injury']].copy()
         
-        # Group by player and calculate baselines (vectorized - much faster!)
+        # Calculate mean, std, and count for each player's healthy weeks (vectorized - fast!)
         baselines = healthy_weeks.groupby('player_norm').agg({
             'point_differential': ['mean', 'std', 'count'],
-            'Position': 'first'  # Get position from lineup data
+            'Position': 'first'
         }).reset_index()
         
-        # Flatten column names
         baselines.columns = ['player_norm', 'baseline_avg', 'baseline_std', 'n_weeks', 'position']
-        
-        # Fill NaN std with 0 (only one data point)
-        baselines['baseline_std'] = baselines['baseline_std'].fillna(0.0)
+        baselines['baseline_std'] = baselines['baseline_std'].fillna(0.0)  # Single data point = 0 std
         
         if self.verbose:
             elapsed = time.time() - start_time
@@ -379,10 +375,11 @@ class InjuryAnalyzer:
     
     def track_consecutive_injuries(self) -> pd.DataFrame:
         """
-        Track consecutive weeks with the same injury type and status.
+        Track consecutive weeks with the same injury type and status per player.
         
-        OPTIMIZED: Uses vectorized operations with groupby instead of per-player loops.
-        Also resets between years to prevent cross-season counting.
+        Uses vectorized operations (shift()) instead of slow groupby().apply() to avoid
+        memory issues. Tracks injuries separately per player/league/year to prevent
+        cross-season counting.
         
         Returns:
             DataFrame with consecutive_injury_weeks column added
@@ -396,74 +393,59 @@ class InjuryAnalyzer:
             start_time = time.time()
         
         df = self.merged_df.copy()
-        df = df.sort_values(['player_norm', 'Year', 'Week']).reset_index(drop=True)
+        # Sort by player, league, year, week to ensure chronological order
+        sort_cols = ['player_norm', 'League_ID', 'Year', 'Week'] if 'League_ID' in df.columns else ['player_norm', 'Year', 'Week']
+        df = df.sort_values(sort_cols).reset_index(drop=True)
         
-        # Initialize consecutive week counter
         df['consecutive_injury_weeks'] = 0
         
-        # OPTIMIZED: Use groupby with apply for vectorized processing
-        # Group by player, league, AND year to track per-league injuries
-        def track_consecutive_group(group):
-            """Track consecutive injuries for a single player-league-year group."""
-            group = group.copy()
-            group = group.sort_values('Week')
-            group['consecutive_injury_weeks'] = 0
-            
-            consecutive_count = 0
-            prev_injury_type = None
-            prev_injury_status = None
-            prev_has_injury = False
-            prev_week = None
-            
-            for idx in group.index:
-                current_week = group.loc[idx, 'Week']
-                has_injury = group.loc[idx, 'has_injury']
-                
-                # Reset if there's a gap in weeks (e.g., week 1 then week 3)
-                if prev_week is not None and current_week != prev_week + 1:
-                    consecutive_count = 0
-                    prev_injury_type = None
-                    prev_injury_status = None
-                    prev_has_injury = False
-                
-                if has_injury:
-                    current_type = group.loc[idx, 'injury_type']
-                    current_status = group.loc[idx, 'injury_status']
-                    
-                    # Check if same injury type AND status as previous week
-                    if (prev_has_injury and 
-                        current_type == prev_injury_type and 
-                        current_status == prev_injury_status and
-                        current_type != 'None' and
-                        prev_week is not None and
-                        current_week == prev_week + 1):  # Must be consecutive weeks
-                        consecutive_count += 1
-                    else:
-                        # Reset count (new injury or different type/status)
-                        consecutive_count = 1
-                    
-                    group.loc[idx, 'consecutive_injury_weeks'] = consecutive_count
-                    prev_injury_type = current_type
-                    prev_injury_status = current_status
-                    prev_has_injury = True
-                else:
-                    # Reset on healthy week
-                    consecutive_count = 0
-                    prev_injury_type = None
-                    prev_injury_status = None
-                    prev_has_injury = False
-                
-                prev_week = current_week
-            
-            return group
+        # Group by player, league, and year so we track injuries separately per context
+        group_cols = ['player_norm', 'League_ID', 'Year'] if 'League_ID' in df.columns else ['player_norm', 'Year']
+        df['_group_id'] = df.groupby(group_cols).ngroup()
+        df = df.sort_values(['_group_id', 'Week']).reset_index(drop=True)
         
-        # Group by player, league, AND year (resets between seasons and leagues)
-        # This prevents counting the same injury across multiple leagues
-        if 'League_ID' in df.columns:
-            df = df.groupby(['player_norm', 'League_ID', 'Year'], group_keys=False).apply(track_consecutive_group).reset_index(drop=True)
-        else:
-            # Fallback if League_ID not available
-            df = df.groupby(['player_norm', 'Year'], group_keys=False).apply(track_consecutive_group).reset_index(drop=True)
+        # Use shift() to look at previous week's data without expensive groupby operations
+        # This is much faster and uses less memory than copying groups
+        df['_prev_group'] = df['_group_id'].shift(1)
+        df['_prev_week'] = df['Week'].shift(1)
+        df['_prev_injury_type'] = df['injury_type'].shift(1)
+        df['_prev_injury_status'] = df['injury_status'].shift(1)
+        df['_prev_has_injury'] = df['has_injury'].shift(1)
+        
+        # Count consecutive weeks: increment if same injury continues, reset if new/different
+        consecutive_counts = []
+        current_count = 0
+        
+        for idx in df.index:
+            # Check if we moved to a new player/league/year or skipped a week
+            is_new_group = df.loc[idx, '_group_id'] != df.loc[idx, '_prev_group']
+            is_consecutive_week = (
+                not is_new_group and 
+                pd.notna(df.loc[idx, '_prev_week']) and
+                df.loc[idx, 'Week'] == df.loc[idx, '_prev_week'] + 1
+            )
+            
+            if is_new_group or not is_consecutive_week:
+                current_count = 0  # Reset counter
+            
+            if df.loc[idx, 'has_injury']:
+                # If previous week had same injury type/status and weeks are consecutive, increment
+                # Otherwise, start counting from 1 (new injury)
+                if (is_consecutive_week and 
+                    df.loc[idx, '_prev_has_injury'] and
+                    df.loc[idx, 'injury_type'] == df.loc[idx, '_prev_injury_type'] and
+                    df.loc[idx, 'injury_status'] == df.loc[idx, '_prev_injury_status'] and
+                    df.loc[idx, 'injury_type'] != 'None'):
+                    current_count += 1
+                else:
+                    current_count = 1
+                consecutive_counts.append(current_count)
+            else:
+                consecutive_counts.append(0)  # Healthy week = 0 consecutive
+        
+        df['consecutive_injury_weeks'] = consecutive_counts
+        df = df.drop(columns=['_group_id', '_prev_group', '_prev_week', 
+                             '_prev_injury_type', '_prev_injury_status', '_prev_has_injury'])
         
         if self.verbose:
             elapsed = time.time() - start_time
@@ -477,15 +459,18 @@ class InjuryAnalyzer:
         self.merged_df = df
         return df
     
-    def analyze_injury_impact(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def prepare_analysis_data(self) -> pd.DataFrame:
         """
-        Perform comprehensive injury impact analysis.
+        Prepare analysis dataset with impact metrics.
+        This is a fast step that can be run separately.
         
         Returns:
-            Tuple of (aggregated_stats_df, individual_records_df)
+            DataFrame with analysis columns and calculated metrics
         """
         if self.verbose:
-            print("\nAnalyzing injury impact...")
+            print("\nPreparing analysis data...")
+            import time
+            start_time = time.time()
         
         if self.merged_df is None:
             self.track_consecutive_injuries()
@@ -499,63 +484,121 @@ class InjuryAnalyzer:
             'Points', 'Projected_Points', 'point_differential',
             'baseline_avg', 'baseline_std', 'n_weeks'
         ]
-        analysis_df = df[analysis_cols].copy()
+        # Only select columns that exist
+        available_cols = [col for col in analysis_cols if col in df.columns]
+        analysis_df = df[available_cols].copy()
         
         # Calculate impact metrics
-        analysis_df['vs_baseline'] = analysis_df['point_differential'] - analysis_df['baseline_avg']
+        analysis_df['vs_baseline'] = analysis_df['point_differential'] - analysis_df['baseline_avg'].fillna(0)
         analysis_df['vs_projected'] = analysis_df['point_differential']
         
-        # Create aggregated statistics
-        agg_stats = []
+        if self.verbose:
+            elapsed = time.time() - start_time
+            print(f"  ✓ Prepared {len(analysis_df):,} records in {elapsed:.1f} seconds")
         
-        # Group by injury type, position, and status
-        for injury_type in analysis_df['injury_type'].unique():
-            if injury_type == 'None':
-                continue
-            
-            for position in analysis_df['position'].dropna().unique():
-                for status in analysis_df['injury_status'].unique():
-                    if status == 'No Injury':
-                        continue
-                    
-                    mask = (
-                        (analysis_df['injury_type'] == injury_type) &
-                        (analysis_df['position'] == position) &
-                        (analysis_df['injury_status'] == status)
-                    )
-                    
-                    if mask.sum() == 0:
-                        continue
-                    
-                    subset = analysis_df[mask]
-                    
-                    agg_stats.append({
-                        'injury_type': injury_type,
-                        'position': position,
-                        'injury_status': status,
-                        'n_weeks': len(subset),
-                        'n_players': subset['player_norm'].nunique(),
-                        'avg_point_differential': subset['point_differential'].mean(),
-                        'median_point_differential': subset['point_differential'].median(),
-                        'std_point_differential': subset['point_differential'].std(),
-                        'avg_vs_baseline': subset['vs_baseline'].mean(),
-                        'median_vs_baseline': subset['vs_baseline'].median(),
-                    })
+        return analysis_df
+    
+    def compute_aggregated_stats(self, analysis_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+        """
+        Compute aggregated statistics using fast vectorized groupby operations.
         
-        agg_stats_df = pd.DataFrame(agg_stats)
+        Replaces slow nested loops with single groupby().agg() call. Groups by
+        injury type, status, position, and consecutive weeks to calculate means,
+        counts, and standard deviations.
+        
+        Args:
+            analysis_df: Optional pre-prepared DataFrame. If None, prepares it automatically.
+        
+        Returns:
+            DataFrame with aggregated statistics (mean, std, count per combination)
+        """
+        if self.verbose:
+            print("\nComputing aggregated statistics (vectorized)...")
+            import time
+            start_time = time.time()
+        
+        if analysis_df is None:
+            analysis_df = self.prepare_analysis_data()
+        
+        # Filter to injured weeks only (exclude 'None' and 'No Injury')
+        injured_df = analysis_df[
+            (analysis_df['has_injury']) &
+            (analysis_df['injury_type'] != 'None') &
+            (analysis_df['injury_status'] != 'No Injury')
+        ].copy()
+        
+        if len(injured_df) == 0:
+            if self.verbose:
+                print("  ⚠️  No injured player-weeks found")
+            return pd.DataFrame()
+        
+        # VECTORIZED: Single groupby operation instead of nested loops
+        agg_stats = injured_df.groupby(['injury_type', 'position', 'injury_status']).agg({
+            'point_differential': ['mean', 'median', 'std', 'count'],
+            'vs_baseline': ['mean', 'median'],
+            'player_norm': 'nunique'  # Count unique players
+        }).reset_index()
+        
+        # Flatten column names
+        agg_stats.columns = [
+            'injury_type', 'position', 'injury_status',
+            'avg_point_differential', 'median_point_differential', 
+            'std_point_differential', 'n_weeks',
+            'avg_vs_baseline', 'median_vs_baseline',
+            'n_players'
+        ]
+        
+        # Fill NaN values
+        agg_stats['std_point_differential'] = agg_stats['std_point_differential'].fillna(0.0)
         
         if self.verbose:
-            print(f"  Generated {len(agg_stats_df):,} aggregated statistics")
+            elapsed = time.time() - start_time
+            print(f"  ✓ Computed {len(agg_stats):,} aggregated statistics in {elapsed:.1f} seconds")
+        
+        return agg_stats
+    
+    def analyze_injury_impact(self, chunked: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Perform comprehensive injury impact analysis.
+        
+        OPTIMIZED: Uses vectorized operations instead of nested loops.
+        Can be run in chunks if chunked=True.
+        
+        Args:
+            chunked: If True, returns partial results for chunked processing
+        
+        Returns:
+            Tuple of (aggregated_stats_df, individual_records_df)
+        """
+        if self.verbose:
+            print("\nAnalyzing injury impact...")
+            import time
+            start_time = time.time()
+        
+        # Step 1: Prepare data (fast)
+        analysis_df = self.prepare_analysis_data()
+        
+        # Step 2: Compute aggregated stats (now vectorized - much faster!)
+        agg_stats_df = self.compute_aggregated_stats(analysis_df)
+        
+        if self.verbose:
+            elapsed = time.time() - start_time
+            print(f"  ✓ Analysis complete in {elapsed:.1f} seconds")
+            print(f"  Aggregated statistics: {len(agg_stats_df):,} combinations")
             print(f"  Individual records: {len(analysis_df):,}")
         
         return agg_stats_df, analysis_df
     
-    def plot_heatmap_type_position(self, save_path: Optional[str] = None) -> plt.Figure:
+    def plot_heatmap_type_position(self, save_path: Optional[str] = None, min_population: int = 30) -> plt.Figure:
         """
         Create heatmap: Injury Type (rows) × Position (columns), color = avg point differential.
         
+        Only includes injury type/position combinations with sufficient data (min_population)
+        to ensure statistical reliability and avoid misleading averages from rare injuries.
+        
         Args:
             save_path: Optional path to save figure
+            min_population: Minimum number of observations required per cell (default: 30)
         
         Returns:
             matplotlib Figure
@@ -565,8 +608,16 @@ class InjuryAnalyzer:
         
         df = self.merged_df[self.merged_df['has_injury']].copy()
         
-        # Aggregate by injury type and position
+        # Count observations per injury type/position combination
+        # This ensures we only show cells with enough data for reliable averages
+        counts = df.groupby(['injury_type', 'position']).size().reset_index(name='count')
         heatmap_data = df.groupby(['injury_type', 'position'])['point_differential'].mean().reset_index()
+        
+        # Merge counts and filter to only include combinations with sufficient data
+        heatmap_data = heatmap_data.merge(counts, on=['injury_type', 'position'])
+        heatmap_data = heatmap_data[heatmap_data['count'] >= min_population]
+        
+        # Pivot to create heatmap matrix
         heatmap_pivot = heatmap_data.pivot(index='injury_type', columns='position', values='point_differential')
         
         # Filter out 'None' injury type
@@ -596,12 +647,16 @@ class InjuryAnalyzer:
         
         return fig
     
-    def plot_heatmap_type_status(self, save_path: Optional[str] = None) -> plt.Figure:
+    def plot_heatmap_type_status(self, save_path: Optional[str] = None, min_population: int = 30) -> plt.Figure:
         """
         Create heatmap: Injury Type (rows) × Status (columns), color = avg point differential.
         
+        Only includes injury type/status combinations with sufficient data (min_population)
+        to ensure statistical reliability.
+        
         Args:
             save_path: Optional path to save figure
+            min_population: Minimum number of observations required per cell (default: 30)
         
         Returns:
             matplotlib Figure
@@ -611,8 +666,15 @@ class InjuryAnalyzer:
         
         df = self.merged_df[self.merged_df['has_injury']].copy()
         
-        # Aggregate by injury type and status
+        # Count observations per injury type/status combination
+        counts = df.groupby(['injury_type', 'injury_status']).size().reset_index(name='count')
         heatmap_data = df.groupby(['injury_type', 'injury_status'])['point_differential'].mean().reset_index()
+        
+        # Filter to only include combinations with sufficient data
+        heatmap_data = heatmap_data.merge(counts, on=['injury_type', 'injury_status'])
+        heatmap_data = heatmap_data[heatmap_data['count'] >= min_population]
+        
+        # Pivot to create heatmap matrix
         heatmap_pivot = heatmap_data.pivot(index='injury_type', columns='injury_status', values='point_differential')
         
         # Filter out 'None' injury type
@@ -684,162 +746,6 @@ class InjuryAnalyzer:
         
         return fig
     
-    def plot_recovery_timeline_by_type(self, save_path: Optional[str] = None) -> plt.Figure:
-        """
-        Plot recovery timeline showing performance over consecutive weeks for same injury type.
-        Shows how expected points fall/climb/stay unchanged.
-        
-        Args:
-            save_path: Optional path to save figure
-        
-        Returns:
-            matplotlib Figure
-        """
-        if self.merged_df is None:
-            self.track_consecutive_injuries()
-        
-        df = self.merged_df[self.merged_df['has_injury']].copy()
-        
-        # Filter to players with 2+ consecutive weeks of same injury
-        df = df[df['consecutive_injury_weeks'] >= 1].copy()
-        
-        # Group by injury type and consecutive week number
-        timeline_data = df.groupby(['injury_type', 'consecutive_injury_weeks']).agg({
-            'point_differential': ['mean', 'std', 'count'],
-            'Projected_Points': 'mean',
-            'Points': 'mean'
-        }).reset_index()
-        
-        timeline_data.columns = [
-            'injury_type', 'consecutive_week', 'avg_diff', 'std_diff', 'n_weeks',
-            'avg_projected', 'avg_actual'
-        ]
-        
-        # Filter to injury types with sufficient data
-        injury_counts = df.groupby('injury_type').size()
-        common_injuries = injury_counts[injury_counts >= 20].index.tolist()
-        timeline_data = timeline_data[timeline_data['injury_type'].isin(common_injuries)]
-        
-        # Create figure
-        n_types = len(common_injuries)
-        fig, axes = plt.subplots(1, min(3, n_types), figsize=(15, 5))
-        if n_types == 1:
-            axes = [axes]
-        elif n_types == 2:
-            axes = list(axes)
-        
-        for idx, injury_type in enumerate(common_injuries[:3]):  # Top 3 most common
-            if idx >= len(axes):
-                break
-            
-            ax = axes[idx]
-            injury_timeline = timeline_data[timeline_data['injury_type'] == injury_type]
-            
-            # Plot average point differential over consecutive weeks
-            ax.plot(
-                injury_timeline['consecutive_week'],
-                injury_timeline['avg_diff'],
-                marker='o',
-                linewidth=2,
-                markersize=8,
-                label='Avg Point Diff'
-            )
-            
-            # Add error bars (std)
-            ax.errorbar(
-                injury_timeline['consecutive_week'],
-                injury_timeline['avg_diff'],
-                yerr=timeline_data['std_diff'],
-                alpha=0.3,
-                capsize=3
-            )
-            
-            # Add horizontal line at 0
-            ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
-            
-            ax.set_xlabel('Consecutive Week with Injury', fontsize=10)
-            ax.set_ylabel('Avg Point Differential', fontsize=10)
-            ax.set_title(f'{injury_type}\n(n={injury_timeline["n_weeks"].sum()} weeks)', fontsize=11)
-            ax.grid(True, alpha=0.3)
-            ax.legend()
-        
-        fig.suptitle('Recovery Timeline by Injury Type\n(Performance Over Consecutive Weeks)', 
-                     fontsize=14, fontweight='bold')
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        
-        return fig
-    
-    def plot_recovery_timeline_by_status(self, save_path: Optional[str] = None) -> plt.Figure:
-        """
-        Plot recovery timeline showing performance over consecutive weeks by injury status.
-        
-        Args:
-            save_path: Optional path to save figure
-        
-        Returns:
-            matplotlib Figure
-        """
-        if self.merged_df is None:
-            self.track_consecutive_injuries()
-        
-        df = self.merged_df[self.merged_df['has_injury']].copy()
-        
-        # Group by status and consecutive week number
-        timeline_data = df.groupby(['injury_status', 'consecutive_injury_weeks']).agg({
-            'point_differential': ['mean', 'std', 'count'],
-            'Projected_Points': 'mean',
-            'Points': 'mean'
-        }).reset_index()
-        
-        timeline_data.columns = [
-            'injury_status', 'consecutive_week', 'avg_diff', 'std_diff', 'n_weeks',
-            'avg_projected', 'avg_actual'
-        ]
-        
-        # Create figure
-        statuses = ['Questionable', 'Doubtful', 'Out']
-        fig, ax = plt.subplots(figsize=(10, 6))
-        
-        for status in statuses:
-            status_timeline = timeline_data[timeline_data['injury_status'] == status]
-            if len(status_timeline) == 0:
-                continue
-            
-            ax.plot(
-                status_timeline['consecutive_week'],
-                status_timeline['avg_diff'],
-                marker='o',
-                linewidth=2,
-                markersize=8,
-                label=status
-            )
-            
-            # Add error bars
-            ax.errorbar(
-                status_timeline['consecutive_week'],
-                status_timeline['avg_diff'],
-                yerr=status_timeline['std_diff'],
-                alpha=0.3,
-                capsize=3
-            )
-        
-        ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
-        ax.set_xlabel('Consecutive Week with Injury', fontsize=12)
-        ax.set_ylabel('Avg Point Differential (Actual - Projected)', fontsize=12)
-        ax.set_title('Recovery Timeline by Injury Status\n(Performance Over Consecutive Weeks)', 
-                     fontsize=14, fontweight='bold')
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        
-        return fig
-    
     def plot_point_differential_distribution(self, save_path: Optional[str] = None) -> plt.Figure:
         """
         Plot distribution of point differentials for injured vs healthy players.
@@ -865,7 +771,7 @@ class InjuryAnalyzer:
         
         ax1.hist(healthy, bins=50, alpha=0.6, label='Healthy', color='green', density=True)
         ax1.hist(injured, bins=50, alpha=0.6, label='Injured', color='red', density=True)
-        ax1.axvline(x=0, color='black', linestyle=' --', alpha=0.5)
+        ax1.axvline(x=0, color='black', linestyle='--', alpha=0.5)
         ax1.set_xlabel('Point Differential (Actual - Projected)', fontsize=11)
         ax1.set_ylabel('Density', fontsize=11)
         ax1.set_title('Overall: Injured vs Healthy', fontsize=12, fontweight='bold')

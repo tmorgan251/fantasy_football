@@ -60,22 +60,22 @@ class FantasyDataCollector:
 
     def _save_to_csv(self, data, filename):
         """
-        Streaming save to prevent memory bloat during 100+ league runs.
-        Uses append mode to add data incrementally rather than loading entire file.
-        Thread-safe for parallel processing.
+        Append data to CSV file in thread-safe manner.
+        
+        Uses append mode to avoid loading entire file into memory. Lock ensures
+        only one thread writes at a time, preventing duplicate headers.
         """
         if not data: return
         df = pd.DataFrame(data)
         filepath = os.path.join(self.data_dir, filename)
         
-        # Thread-safe file writing (multiple threads may write simultaneously)
+        # Lock prevents multiple threads from writing simultaneously
         with self._write_lock:
-            # Check file existence inside lock to prevent race condition
-            # where multiple threads all see file doesn't exist and write headers
+            # Check if file exists inside lock to avoid race condition
+            # (multiple threads checking at same time could all write headers)
             file_exists = os.path.isfile(filepath) and os.path.getsize(filepath) > 0
-            # Append mode ('a'): adds to existing file
-            # header=not file_exists: only write header if file is new (first write)
-            # This prevents duplicate headers when appending
+            # Append mode: adds to existing file without reading it first
+            # Only write header if file is new (prevents duplicate headers)
             df.to_csv(filepath, mode='a', index=False, header=not file_exists)
 
     def _print_object_info(self, obj, obj_name):
@@ -196,15 +196,13 @@ class FantasyDataCollector:
             r.raise_for_status()
             data = r.json()
 
-            # The 'seasons' endpoint returns a direct dictionary, not a list
-            # Safe dictionary access: if 'draftDetail' doesn't exist, use empty dict, then get 'picks' or empty list
+            # Extract draft picks from API response (safe access with defaults)
             picks = data.get('draftDetail', {}).get('picks', [])
             
-            # Map IDs to names using the league object (which is still useful for metadata)
+            # Create player ID -> name mapping from league object
+            # Raw API only gives us IDs, so we use espn-api league object to get names
             if self.verbose and league.draft:
                 self._print_object_info(league.draft[0], "league.draft[0] (draft player)")
-            # Dictionary comprehension: Create mapping from player ID to player name
-            # This allows us to look up player names when we only have IDs from the raw API
             player_map = {p.playerId: p.playerName for p in league.draft}
             
             if self.verbose and league.teams:
@@ -217,11 +215,9 @@ class FantasyDataCollector:
                 p_id = p.get('playerId')
                 t_id = p.get('teamId')
                 
-                # THE GOLDEN TICKET: The raw autoDraftTypeId from ESPN API
-                # This field indicates if a pick was autodrafted (non-zero) or manual (0)
+                # Extract auto-draft flag: autoDraftTypeId is non-zero if autodrafted, 0 if manual
                 auto_id = p.get('autoDraftTypeId', 0)
-                # Convert to binary: 1 if autodrafted (auto_id > 0), 0 if manual
-                is_auto = 1 if auto_id > 0 else 0
+                is_auto = 1 if auto_id > 0 else 0  # Convert to binary flag
                 
                 overall = p.get('overallPickNumber')
 
@@ -231,16 +227,17 @@ class FantasyDataCollector:
                     p_name = player_map.get(p_id, f"Player {p_id}")
                     print(f"Pick {overall:03} {status:15} | {p_name:20} -> Team {t_id}")
 
+                # Create row for this draft pick with all relevant metadata
                 rows.append({
                     'League_ID': lid, 
                     'Year': year, 
-                    'Player': player_map.get(p_id, f"ID:{p_id}"),
+                    'Player': player_map.get(p_id, f"ID:{p_id}"),  # Use mapped name or fallback to ID
                     'Team': t_id,
-                    'Round': p.get('roundId'), 
-                    'Pick': p.get('roundPickNumber'), 
-                    'Overall': overall, 
-                    'Is_Autodrafted': is_auto, 
-                    'Auto_Draft_Type_ID': auto_id
+                    'Round': p.get('roundId'),  # Round number (1-16 typically)
+                    'Pick': p.get('roundPickNumber'),  # Pick within round (1-12 for 12-team league)
+                    'Overall': overall,  # Overall pick number across entire draft
+                    'Is_Autodrafted': is_auto,  # 1 if auto-drafted, 0 if manual
+                    'Auto_Draft_Type_ID': auto_id  # Type of auto-draft (if applicable)
                 })
         except Exception as e:
             if self.verbose: print(f"! Raw Draft API Error: {e}")
