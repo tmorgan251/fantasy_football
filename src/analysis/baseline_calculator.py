@@ -66,27 +66,18 @@ class BaselineCalculator:
             self._load_data()
         
         # Identify leagues where ALL picks are autodrafted
-        # Group by League_ID and aggregate: sum of Is_Autodrafted (1s) and count of total picks
         league_auto_status = self._draft_df.groupby('League_ID')['Is_Autodrafted'].agg(['sum', 'count'])
-        # Calculate percentage: sum of auto picks / total picks = percentage autodrafted
         league_auto_status['pct_auto'] = league_auto_status['sum'] / league_auto_status['count']
-        # Filter for leagues where 100% of picks are auto (pct_auto == 1.0)
-        # .index gets the League_IDs, .tolist() converts to list
         fully_auto_leagues = league_auto_status[league_auto_status['pct_auto'] == 1.0].index.tolist()
         
         if len(fully_auto_leagues) == 0:
             print("Warning: No 100% auto-drafted leagues found.")
             return pd.DataFrame(columns=['Player', 'Total_Points'])
         
-        # Get all players from fully auto leagues
-        # Filter draft data to only leagues that are 100% auto-drafted
-        # .isin() checks if League_ID is in our list of fully auto leagues
-        # .unique() gets unique player names (removes duplicates)
+        # Get unique players from fully auto leagues and sum their total points
         auto_draft_players = self._draft_df[
             self._draft_df['League_ID'].isin(fully_auto_leagues)
         ]['Player'].unique()
-        
-        # Sum points for these players across all weeks
         player_points = self._lineup_df[
             self._lineup_df['Player'].isin(auto_draft_players)
         ].groupby('Player')['Points'].sum().reset_index()
@@ -117,32 +108,19 @@ class BaselineCalculator:
             print("Warning: No waiver transactions found.")
             return pd.DataFrame(columns=['Position', 'Avg_Net_Points'])
         
-        # Get total points and position for each player from lineup data
+        # Get total points and position for each player
         if 'Position' in self._lineup_df.columns:
-            # Use Position from lineup_data if available
-            # Group by Player and aggregate:
-            #   - Points: sum all points across all weeks
-            #   - Position: take first value (positions don't change, so any row works)
             player_info = self._lineup_df.groupby('Player').agg({
                 'Points': 'sum',
-                'Position': 'first'  # Take first position (should be consistent)
+                'Position': 'first'
             }).reset_index()
             player_info.columns = ['Player', 'Total_Points', 'Position']
         else:
-            # Fallback: just get points
             player_info = self._lineup_df.groupby('Player')['Points'].sum().reset_index()
             player_info.columns = ['Player', 'Total_Points']
         
-        # Calculate net points per transaction
-        # Merge transaction data with player point totals (left join keeps all transactions)
-        waiver_trans = waiver_trans.merge(
-            player_info, on='Player', how='left'
-        )
-        # Calculate net points: positive for adds, negative for drops
-        # Lambda function applies to each row:
-        #   - If WAIVER_ADD: add the player's total points (positive impact)
-        #   - If DROP: subtract the player's total points (negative impact)
-        # axis=1 means apply function row-wise (to each row)
+        # Merge with transaction data and calculate net points (positive for adds, negative for drops)
+        waiver_trans = waiver_trans.merge(player_info, on='Player', how='left')
         waiver_trans['Net_Points'] = waiver_trans.apply(
             lambda row: row['Total_Points'] if row['Action'] == 'WAIVER_ADD' 
             else -row['Total_Points'], axis=1
@@ -162,12 +140,9 @@ class BaselineCalculator:
             print("Warning: No transactions with position data found.")
             return pd.DataFrame(columns=['Position', 'Avg_Net_Points'])
         
-        # Average by position
-        # Group transactions by Position and calculate mean Net_Points
-        # This gives us the average impact of waiver moves by position
+        # Average net points by position
         position_avg = waiver_trans.groupby('Position')['Net_Points'].mean().reset_index()
         position_avg.columns = ['Position', 'Avg_Net_Points']
-        # Sort by average net points (descending) to see which positions benefit most
         return position_avg.sort_values('Avg_Net_Points', ascending=False)
     
     def calculate_trade_baseline(self) -> Dict:
@@ -232,8 +207,6 @@ class BaselineCalculator:
             return pd.DataFrame()
         
         if position_limits is None:
-            # Standard fantasy lineup configuration
-            # Dictionary maps position to number of required starters
             position_limits = {
                 'QB': 1, 'RB': 2, 'WR': 2, 'TE': 1, 
                 'FLEX': 1, 'K': 1, 'D/ST': 1
@@ -242,8 +215,6 @@ class BaselineCalculator:
         results = []
         
         # Process each league/week/team combination
-        # groupby() creates groups for each unique combination of League_ID, Week, Team
-        # Tuple unpacking: (league_id, week, team) is the group key, group is the DataFrame
         for (league_id, week, team), group in lineup_with_pos.groupby(['League_ID', 'Week', 'Team']):
             optimal_points = self._optimize_lineup(
                 group, position_limits, use_projected=True
@@ -281,34 +252,21 @@ class BaselineCalculator:
         players_sorted = player_data.sort_values(score_col, ascending=False)
         
         selected = []
-        flex_candidates = []
         
         # Fill position-specific slots (QB, RB, WR, TE, K, D/ST)
         for pos, limit in position_limits.items():
             if pos == 'FLEX':
-                continue  # Skip FLEX for now, fill it after position-specific slots
+                continue  # Fill FLEX after position-specific slots
             
-            # Filter players by position and take top N (where N = limit)
-            # Boolean indexing: players_sorted['Position'] == pos creates boolean mask
-            # .head(limit) takes the first N players (already sorted by projected points)
-            pos_players = players_sorted[
-                players_sorted['Position'] == pos
-            ].head(limit)
+            # Select top N players at this position (sorted by projected points)
+            pos_players = players_sorted[players_sorted['Position'] == pos].head(limit)
             
             for _, player in pos_players.iterrows():
                 selected.append(player['Player'])
-                # Track potential FLEX candidates (RB, WR, TE not selected)
-                if pos in ['RB', 'WR', 'TE']:
-                    flex_candidates.append(player)
         
-        # Fill FLEX position (can be RB, WR, or TE)
+        # Fill FLEX position with best remaining RB/WR/TE
         if 'FLEX' in position_limits:
             flex_limit = position_limits['FLEX']
-            # Get best remaining RB, WR, TE that weren't already selected
-            # Complex boolean indexing:
-            #   - Position must be RB, WR, or TE (using .isin())
-            #   - AND player must NOT be in selected list (using ~ for NOT and .isin())
-            #   - Then take top N remaining players
             remaining = players_sorted[
                 (players_sorted['Position'].isin(['RB', 'WR', 'TE'])) &
                 (~players_sorted['Player'].isin(selected))
@@ -317,36 +275,9 @@ class BaselineCalculator:
             for _, player in remaining.iterrows():
                 selected.append(player['Player'])
         
-        # Calculate total points for selected players (use actual Points, not projected)
-        # Filter original player_data to only selected players
-        # .isin(selected) creates boolean mask for players in our optimal lineup
+        # Sum actual points for selected players
         selected_players = player_data[player_data['Player'].isin(selected)]
-        # Sum up the actual points scored by the optimal projected lineup
         total_points = selected_players['Points'].sum()
         
         return total_points
-
-
-# Example usage
-if __name__ == "__main__":
-    calculator = BaselineCalculator()
-    
-    # Draft baseline
-    draft_baseline = calculator.calculate_draft_baseline()
-    print("Draft Baseline (Top 10):")
-    print(draft_baseline.head(10))
-    
-    # Trade baseline
-    trade_baseline = calculator.calculate_trade_baseline()
-    print(f"\nTrade Baseline: {trade_baseline}")
-    
-    # Waiver baseline (uses Position from CSV if available)
-    waiver_baseline = calculator.calculate_waiver_baseline()
-    print("\nWaiver Wire Baseline (by Position):")
-    print(waiver_baseline)
-    
-    # Start/Sit baseline (uses Position from CSV if available)
-    startsit_baseline = calculator.calculate_startsit_baseline()
-    print("\nStart/Sit Baseline (sample):")
-    print(startsit_baseline.head(10))
 
