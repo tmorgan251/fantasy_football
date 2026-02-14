@@ -213,6 +213,7 @@ class InjuryAnalyzer:
                     lineup_df['Year'] = int(part)
                     break
         else:
+            # Condition should never happen but who knows what env this could be ran in...
             # Search in year subdirectories
             script_dir = Path(__file__).parent
             project_root = script_dir.parent.parent
@@ -358,6 +359,7 @@ class InjuryAnalyzer:
         # Use position from lineup data (more reliable), fallback to injury data position
         # Note: 'Position' (capital P) is from lineup_df, 'position' (lowercase) is from injury_df
         # Since they have different capitalization, both columns exist after merge
+        # TODO: Should look to see if there is a better way to handle this
         if 'Position' in merged.columns and 'position' in merged.columns:
             merged['position'] = merged['Position'].fillna(merged['position'])
         elif 'Position' in merged.columns:
@@ -486,6 +488,7 @@ class InjuryAnalyzer:
         # Fill NaN values
         agg_stats['std_point_differential'] = agg_stats['std_point_differential'].fillna(0.0)
         
+        # TODO: Should probably get rid of this since I am no longer having high runtime issues
         if self.verbose:
             elapsed = time.time() - start_time
             print(f"  Computed {len(agg_stats):,} aggregated statistics in {elapsed:.1f} seconds")
@@ -514,6 +517,7 @@ class InjuryAnalyzer:
         agg_stats_df = self.compute_aggregated_stats(analysis_df)
         
         if self.verbose:
+            # TODO: Should probably get rid of the time printout since I am no longer having high runtime issues
             elapsed = time.time() - start_time
             print(f"  Analysis complete in {elapsed:.1f} seconds")
             print(f"  Aggregated statistics: {len(agg_stats_df):,} combinations")
