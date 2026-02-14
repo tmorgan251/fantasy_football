@@ -171,9 +171,6 @@ class DraftValueAnalyzer:
                     if self.verbose:
                         print(f"  {fname}: dropped {dropped:,} duplicate rows ({before:,} → {after:,})")
     
-    # Return type annotation (-> Tuple[pd.DataFrame, pd.DataFrame]): Documents that this
-    # returns a tuple of two DataFrames. Without this, you'd have to read the code to know
-    # you need to unpack: draft, lineups = analyzer.load_multi_season_data()
     def load_multi_season_data(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """Load draft and lineup data across multiple seasons."""
         if self.verbose:
@@ -182,6 +179,7 @@ class DraftValueAnalyzer:
         draft_parts = []
         lineup_parts = []
         
+        # TODO: Should probably clean this and make it more readable.
         for year_dir in sorted([
             p for p in self.raw_base.iterdir() 
             if p.is_dir() and p.name.isdigit() and len(p.name) == 4
