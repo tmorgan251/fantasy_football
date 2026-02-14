@@ -89,9 +89,19 @@ class DraftValueAnalyzer:
         
     # ==================== UTILITY METHODS ====================
     
+    # @staticmethod decorator: This method doesn't need access to 'self' (the instance).
+    # It can be called directly on the class: DraftValueAnalyzer.normalize_player_name(...)
+    # without creating an instance. This is useful for utility functions that logically
+    # belong to the class but don't use instance data.
     @staticmethod
     def normalize_player_name(name: str, synonyms: Dict[str, str] = None) -> str:
-        """Normalize player name for consistent matching."""
+        """
+        Normalize player name for consistent matching.
+        
+        Return type annotation (-> str): Tells Python and IDEs what type this function
+        returns. This helps with type checking, autocomplete, and makes the code
+        self-documenting. Without it, you'd have to read the code to know it returns a string.
+        """
         if pd.isna(name):
             return name
         s = str(name).strip()
@@ -101,9 +111,16 @@ class DraftValueAnalyzer:
             s = synonyms.get(s, s)
         return s
     
+    # @staticmethod decorator: Same reasoning as above - utility function that doesn't
+    # need instance data, so it can be called without creating an object.
     @staticmethod
     def normalize_slot(slot: str) -> str:
-        """Normalize lineup slot designation."""
+        """
+        Normalize lineup slot designation.
+        
+        Return type annotation (-> str): Documents that this returns a string, enabling
+        better IDE support and type checking tools.
+        """
         s = str(slot).strip().upper()
         if s in {"DST", "DEF", "D/ST"}:
             return "D/ST"
@@ -119,6 +136,8 @@ class DraftValueAnalyzer:
     
     # ==================== DATA LOADING ====================
     
+    # Return type annotation (-> None): This method modifies files but doesn't return
+    # a value. The annotation makes it clear there's no return value to use.
     def clean_raw_data(self) -> None:
         """Drop duplicate rows in raw CSV files."""
         if self.verbose:
@@ -150,6 +169,9 @@ class DraftValueAnalyzer:
                     if self.verbose:
                         print(f"  {fname}: dropped {dropped:,} duplicate rows ({before:,} → {after:,})")
     
+    # Return type annotation (-> Tuple[pd.DataFrame, pd.DataFrame]): Documents that this
+    # returns a tuple of two DataFrames. Without this, you'd have to read the code to know
+    # you need to unpack: draft, lineups = analyzer.load_multi_season_data()
     def load_multi_season_data(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """Load draft and lineup data across multiple seasons."""
         if self.verbose:
@@ -204,6 +226,8 @@ class DraftValueAnalyzer:
         df = pd.read_csv(path)
         required = ["League_ID", "Player", "Team", "Round", "Pick", "Overall", 
                    "Is_Autodrafted", "Auto_Draft_Type_ID"]
+        # List comprehension: Build list of missing column names
+        # Iterates through required columns, keeps only those not in df.columns
         missing = [c for c in required if c not in df.columns]
         if missing:
             raise ValueError(f"{path} draft_data is missing columns: {missing}")
@@ -227,6 +251,8 @@ class DraftValueAnalyzer:
         
         df = df.copy()
         df["Year"] = int(year)
+        # map() with lambda: Apply normalize_player_name to each player name
+        # Lambda needed because normalize_player_name requires the synonyms parameter
         df["Player_norm"] = df["Player"].map(lambda x: self.normalize_player_name(x, self.anchor_synonyms))
         df["League_ID"] = df["League_ID"].astype(int)
         df["Year"] = df["Year"].astype(int)
@@ -283,7 +309,13 @@ class DraftValueAnalyzer:
         return draft_filt, lineups_filt, league_sig
     
     def _infer_league_starter_signature(self, lineups: pd.DataFrame) -> pd.DataFrame:
-        """Infer starter configuration for each league-year."""
+        """
+        Infer starter configuration for each league-year.
+        
+        Analyzes lineup data to determine how many starters each league uses at each position.
+        Uses the mode (most common) starter count across all team-weeks to identify the
+        league's standard configuration.
+        """
         df = lineups.copy()
         required = {"League_ID", "Year", "Team", "Week", "Slot", "Is_Starter"}
         missing = required - set(df.columns)
@@ -291,14 +323,17 @@ class DraftValueAnalyzer:
             raise ValueError(f"lineups missing columns for starter signature: {sorted(missing)}")
         
         df["Slot_norm"] = df["Slot"].map(self.normalize_slot)
+        # Filter to only starter slots (Is_Starter == 1)
         starters = df[df["Is_Starter"].fillna(0).astype(int) == 1].copy()
         
+        # Count starters by position for each team-week
         tw = (
             starters.groupby(["League_ID", "Year", "Team", "Week", "Slot_norm"])
             .size()
             .reset_index(name="n")
         )
         
+        # Pivot to get position counts as columns (one row per team-week)
         pivot = (
             tw.pivot_table(
                 index=["League_ID", "Year", "Team", "Week"],
@@ -310,16 +345,20 @@ class DraftValueAnalyzer:
             .reset_index()
         )
         
+        # Ensure all position columns exist (some leagues may not use all positions)
         for col in ["QB", "RB", "WR", "TE", "K", "D/ST", "FLEX", "OP"]:
             if col not in pivot.columns:
                 pivot[col] = 0
         
         pivot["Starters_Total"] = pivot[["QB", "RB", "WR", "TE", "K", "D/ST", "FLEX", "OP"]].sum(axis=1)
         
+        # Helper function to get mode (most common value) from a series
         def mode_int(s: pd.Series) -> int:
             vc = s.value_counts()
             return int(vc.index[0]) if len(vc) else 0
         
+        # Aggregate to league-year level: use mode across all team-weeks
+        # This handles cases where a team might have different lineups due to bye weeks
         league_sig = (
             pivot.groupby(["League_ID", "Year"], dropna=False)
             .agg(
@@ -336,6 +375,7 @@ class DraftValueAnalyzer:
             .reset_index()
         )
         
+        # Create human-readable signature string for easy identification
         league_sig["Signature"] = (
             "QB=" + league_sig["QB"].astype(str) +
             ",RB=" + league_sig["RB"].astype(str) +
@@ -373,6 +413,9 @@ class DraftValueAnalyzer:
             meta = pd.DataFrame(columns=["League_ID", "Year", "Anchors_Hit", "Anchors_Outlier", "Drop"])
             return draft, lineups, meta
         
+        # Compute robust z-scores using median and MAD (Median Absolute Deviation)
+        # This is more robust to outliers than standard z-scores using mean/std
+        # The constant 0.6745 scales MAD to match standard deviation for normal distributions
         def robust_z(s: pd.Series) -> pd.Series:
             x = s.astype(float)
             med = np.nanmedian(x)
@@ -381,6 +424,8 @@ class DraftValueAnalyzer:
                 return (x - med) * 0.0
             return 0.6745 * (x - med) / mad
         
+        # Calculate robust z-scores grouped by year and player
+        # This compares each league's anchor player points to the distribution across all leagues
         a["rz"] = a.groupby(["Year", "Player_norm"], dropna=False)["Season_Total_Points"].transform(robust_z)
         a["Is_Outlier"] = a["rz"].abs() >= z_thresh
         
@@ -390,6 +435,8 @@ class DraftValueAnalyzer:
                 Anchors_Hit=("Player_norm", "nunique"),
                 AnchorRows=("Player_norm", "size"),
                 Anchors_Outlier=("Is_Outlier", "sum"),
+                # Lambda function: Find maximum absolute robust z-score for this league-year
+                # Converts to numpy array, takes absolute value, finds max, handles empty case
                 MaxAbsRZ=("rz", lambda s: float(np.nanmax(np.abs(s.to_numpy()))) if len(s) else np.nan),
             )
             .reset_index()
@@ -477,6 +524,8 @@ class DraftValueAnalyzer:
             print("\n=== Enriching Draft Data ===")
         
         d = draft.copy()
+        # map() with lambda: Re-normalize player names (in case they weren't normalized before)
+        # Lambda needed to pass synonyms parameter to normalize_player_name
         d["Player_norm"] = d["Player_norm"].map(
             lambda x: self.normalize_player_name(x, self.anchor_synonyms)
         )
@@ -487,7 +536,9 @@ class DraftValueAnalyzer:
         out = d.merge(pos, on=["League_ID", "Year", "Player_norm"], how="left")
         out = out.merge(pts, on=["League_ID", "Year", "Player_norm"], how="left")
         
-        # Deduplicate after merges (merges can create duplicates if source data has duplicates)
+        # Deduplicate after merges
+        # Merges can create duplicates if source data has duplicates (e.g., same player
+        # drafted multiple times in same league, or multiple lineup entries for same player)
         # Keep first occurrence of each League_ID/Year/Overall combination
         before_dedup = len(out)
         out = out.drop_duplicates(subset=["League_ID", "Year", "Overall"], keep="first")
@@ -518,18 +569,27 @@ class DraftValueAnalyzer:
         return self.draft_enriched
     
     def _infer_position_from_slots(self, lineups: pd.DataFrame) -> pd.DataFrame:
-        """Infer player position from lineup slots."""
+        """
+        Infer player position from lineup slots.
+        
+        Uses the most common core position slot (QB/RB/WR/TE/K/D/ST) a player appears in.
+        Prioritizes core positions over flex slots to get the player's true position.
+        """
         x = lineups.copy()
         x["Slot_norm"] = x["Slot"].map(self.normalize_slot)
+        # Identify core positions (non-flex slots that indicate true position)
         x["Is_core_pos"] = x["Slot_norm"].isin({"QB", "RB", "WR", "TE", "K", "D/ST"})
         
+        # Count appearances by slot for each player
         counts = (
             x.groupby(["League_ID", "Year", "Player_norm", "Slot_norm", "Is_core_pos"], dropna=False)
             .size().reset_index(name="n")
+            # Sort to prioritize core positions, then by frequency
             .sort_values(by=["League_ID", "Year", "Player_norm", "Is_core_pos", "n"],
                          ascending=[True, True, True, False, False])
         )
         
+        # Take first (most common core position) for each player
         top = (
             counts.drop_duplicates(subset=["League_ID", "Year", "Player_norm"])
             .rename(columns={"Slot_norm": "Position"})[["League_ID", "Year", "Player_norm", "Position"]]
@@ -588,14 +648,23 @@ class DraftValueAnalyzer:
         if self.verbose:
             print(f"Optimizing {n_groups:,} team-weeks...")
         
+        # Process each team-week group and track progress
+        # t0 tracks start time for calculating processing rate
         t0 = time.time()
         selected_parts = []
+        # enumerate(gb, start=1) gives us (1, (key, group)), (2, (key, group)), etc.
+        # We use start=1 so progress shows 1/N instead of 0/N
         for i, (_, g) in enumerate(gb, start=1):
+            # Print progress at intervals, on first iteration, and on last iteration
+            # This ensures we always see start and completion, plus periodic updates
             if i % status_every == 0 or i == 1 or i == n_groups:
                 elapsed = time.time() - t0
+                # Calculate rate: groups processed per second
+                # Handle division by zero (shouldn't happen, but defensive programming)
                 rate = i / elapsed if elapsed > 0 else float("inf")
                 if self.verbose:
                     print(f"  - progress: {i:,}/{n_groups:,} groups ({rate:.1f} groups/s)")
+            # Process this team-week's optimal lineup and append to results list
             selected_parts.append(self._choose_optimal_lineup_for_group(g, slot_counts, flex_eligible))
         
         selected = pd.concat(selected_parts, ignore_index=True)
@@ -623,6 +692,9 @@ class DraftValueAnalyzer:
         if core_rows.empty:
             raise ValueError("No core slots found in lineup_data Slot column (QB/RB/WR/TE/K/DST).")
         
+        # Group by player and get most common slot (position) they played
+        # Lambda function: value_counts() counts occurrences, .index[0] gets most common
+        # This handles cases where a player might occasionally play a different position
         pos = (
             core_rows.groupby(["League_ID", "Year", "Team", "Player_norm"])["Slot"]
             .agg(lambda s: s.value_counts().index[0])
@@ -654,32 +726,44 @@ class DraftValueAnalyzer:
         slot_counts: Dict[str, int],
         flex_eligible: Set[str]
     ) -> pd.DataFrame:
-        """Choose optimal lineup for a single team-week."""
+        """
+        Choose optimal lineup for a single team-week using greedy selection.
+        
+        Selects the highest-scoring players at each position, respecting position limits.
+        FLEX positions are filled after all required positions, using remaining eligible players.
+        This is a greedy algorithm that may not be globally optimal but is fast and effective.
+        """
         g = g.copy()
         g["SelectedOptimal"] = False
-        used = set()
+        used = set()  # Track players already selected to avoid duplicates
         
         def select_top(pos, n):
+            """Select top N players at a specific position, excluding already-used players."""
             nonlocal used
             if n <= 0:
                 return []
+            # Filter by position, exclude used players, sort by points descending
             cand = g[(g["Position"] == pos) & (~g["Player_norm"].isin(used))].sort_values("WeekPoints", ascending=False)
             chosen = cand.head(n)["Player_norm"].tolist()
-            used.update(chosen)
+            used.update(chosen)  # Mark as used
             return chosen
         
         def select_flex(n):
+            """Select top N players from flex-eligible positions (RB/WR/TE), excluding used players."""
             nonlocal used
             if n <= 0:
                 return []
+            # Filter by flex-eligible positions, exclude used players, sort by points descending
             cand = g[(g["Position"].isin(flex_eligible)) & (~g["Player_norm"].isin(used))].sort_values("WeekPoints", ascending=False)
             chosen = cand.head(n)["Player_norm"].tolist()
-            used.update(chosen)
+            used.update(chosen)  # Mark as used
             return chosen
         
+        # Fill required positions first (QB, RB, WR, TE, K, D/ST)
         selected = []
         for pos in ["QB", "RB", "WR", "TE", "K", "D/ST"]:
             selected += select_top(pos, slot_counts.get(pos, 0))
+        # Fill FLEX positions last (from remaining RB/WR/TE)
         selected += select_flex(slot_counts.get("FLEX", 0))
         
         g.loc[g["Player_norm"].isin(selected), "SelectedOptimal"] = True
@@ -874,12 +958,19 @@ class DraftValueAnalyzer:
         trim: float = 0.10,
         smooth_window: int = 5
     ) -> pd.DataFrame:
-        """Compute pooled denoised expected values."""
+        """
+        Compute pooled denoised expected values across all years.
+        
+        Uses only fully-autodrafted teams to establish baseline expected value at each pick.
+        Applies robust statistical estimators (trimmed mean, winsorized mean) to reduce
+        impact of outliers, then smooths the curve with a rolling average.
+        """
         df = draft_with_valid.copy()
         df["Overall"] = pd.to_numeric(df["Overall"], errors="coerce").astype(int)
         df["Is_Autodrafted"] = pd.to_numeric(df["Is_Autodrafted"], errors="coerce").fillna(0).astype(int)
         df["Season_Total_Points_Valid"] = pd.to_numeric(df["Season_Total_Points_Valid"], errors="coerce")
         
+        # Identify fully-autodrafted teams (all picks were autodrafted)
         team_auto = (
             df.groupby(["League_ID", "Year", "Team"], dropna=False)["Is_Autodrafted"]
             .agg(Total_Picks="size", Autodrafted_Picks="sum")
@@ -893,17 +984,25 @@ class DraftValueAnalyzer:
         if df_auto.empty:
             raise ValueError("No fully-autodrafted teams found.")
         
+        # Select aggregation function based on estimator type
+        # Trimmed mean removes extreme values, winsorized mean caps them
+        # Select aggregation function based on estimator type
+        # Lambda functions convert pandas Series to numpy array, apply transformation, return float
         if estimator == "mean":
             agg_func = "mean"
         elif estimator == "median":
+            # nanmedian ignores NaN values when computing median
             agg_func = lambda s: float(np.nanmedian(s.to_numpy()))
         elif estimator == "trimmed_mean":
+            # trim_mean removes extreme values (top/bottom trim%) before computing mean
             agg_func = lambda s: float(trim_mean(s.dropna().to_numpy(), proportiontocut=trim))
         elif estimator == "winsor_mean":
+            # winsorize caps extreme values (limits=trim) instead of removing them
             agg_func = lambda s: float(np.mean(winsorize(s.dropna().to_numpy(), limits=trim)))
         else:
             raise ValueError("estimator must be one of: mean, median, trimmed_mean, winsor_mean")
         
+        # Aggregate by pick number across all years
         pooled = (
             df_auto.groupby("Overall", dropna=False)["Season_Total_Points_Valid"]
             .agg(Expected_Valid_Points=agg_func, Std_Valid_Points="std", N="count")
@@ -911,6 +1010,8 @@ class DraftValueAnalyzer:
             .sort_values("Overall")
         )
         
+        # Apply rolling average smoothing to reduce noise
+        # Center=True means the window is centered on each point
         if smooth_window and smooth_window > 1:
             pooled["Expected_Smoothed"] = (
                 pooled["Expected_Valid_Points"].rolling(window=smooth_window, center=True, min_periods=1).mean()
@@ -928,26 +1029,36 @@ class DraftValueAnalyzer:
         w_col: str = "N",
         degree: int = 4
     ) -> pd.DataFrame:
-        """Fit polynomial baseline to expected curve."""
+        """
+        Fit polynomial baseline to expected curve using weighted least squares.
+        
+        Weights the fit by sample size (N) at each pick, so picks with more data
+        have more influence on the curve. This creates a smooth baseline that
+        captures the general trend while reducing impact of noisy individual picks.
+        """
         df = expected_pooled.copy()
         
         x = pd.to_numeric(df[x_col], errors="coerce").to_numpy(dtype=float)
         y = pd.to_numeric(df[y_col], errors="coerce").to_numpy(dtype=float)
         
+        # Use sample size as weights (more data = higher weight)
         if w_col in df.columns:
             w = pd.to_numeric(df[w_col], errors="coerce").fillna(1.0).to_numpy(dtype=float)
         else:
             w = np.ones_like(x)
         
+        # Filter out invalid values (NaN, inf, zero weights)
         m = np.isfinite(x) & np.isfinite(y) & np.isfinite(w) & (w > 0)
         x, y, w = x[m], y[m], w[m]
         
         if len(x) < degree + 2:
             raise ValueError(f"Not enough points to fit degree={degree} polynomial.")
         
+        # Fit weighted polynomial using least squares
         coeff = np.polyfit(x, y, deg=degree, w=w)
         p = np.poly1d(coeff)
         
+        # Evaluate polynomial at all x values (including those filtered out)
         df["Poly_Expected"] = p(pd.to_numeric(df[x_col], errors="coerce").to_numpy(dtype=float))
         df["Poly_Degree"] = degree
         return df

@@ -224,7 +224,7 @@ class FantasyDataCollector:
         if self.verbose: 
             print("\n[SECTION 4: SEASONAL TRANSACTION LOG]")
         
-        # Collect all data first for batch writing (much faster than per-week writes)
+        # Collect all data first for batch writing
         all_lineups = []
         all_transactions = []
 
@@ -276,10 +276,14 @@ class FantasyDataCollector:
 
                 if master_rosters_prev:
                     # Detect transactions by comparing current vs previous week rosters
+                    # set().union(*dict.values()) combines all sets from dictionary values into one set
+                    # The * unpacks the dictionary values (which are sets) as arguments to union()
                     all_prev = set().union(*master_rosters_prev.values())  # All players from last week
                     all_curr = set().union(*curr_rosters.values())  # All players this week
                     
-                    # Find arrivals (new players) and departures (players who left)
+                    # Dictionary comprehensions: Find players who joined/left each team
+                    # arrivals: set difference (current - previous) = new players this week
+                    # departures: set difference (previous - current) = players who left
                     arrivals = {tid: names - master_rosters_prev.get(tid, set()) 
                                for tid, names in curr_rosters.items()}
                     departures = {tid: master_rosters_prev.get(tid, set()) - names 
@@ -287,8 +291,12 @@ class FantasyDataCollector:
 
                     for tid, joined_players in arrivals.items():
                         for p in joined_players:
-                            # Trade detection: player was on another team last week AND
-                            # this team had a player leave who's now on another team
+                            # Trade detection logic:
+                            # 1. Player was on another team last week (p in all_prev)
+                            # 2. AND this team had a player leave (departures.get(tid, []))
+                            # 3. AND that departed player is now on another team (d in all_curr)
+                            # If all true, it's a trade; otherwise it's a waiver add
+                            # any() returns True if any departed player is found on another team
                             is_trade = (p in all_prev) and any(d in all_curr for d in departures.get(tid, []))
                             action = 'TRADE_JOIN' if is_trade else 'WAIVER_ADD'
                             if self.verbose: 
@@ -321,7 +329,7 @@ class FantasyDataCollector:
             except: 
                 continue
         
-        # Write all batched data at once (much faster than per-week writes)
+        # Write all batched data at once
         if batch_writes:
             self._save_to_csv(all_lineups, "lineup_data.csv")
             self._save_to_csv(all_transactions, "transaction_data.csv")
@@ -537,7 +545,7 @@ def collect_injury_data(years, output_dir=None):
             injuries_df = nfl.import_injuries([year])
             
             if injuries_df.empty:
-                print(f"  ⚠ No injury data found for {year}")
+                print(f"  Warning: No injury data found for {year}")
                 continue
             
             # Save to CSV
@@ -567,7 +575,7 @@ def collect_injury_data(years, output_dir=None):
         'total_records': total_records
     }
 
-
 # Main execution code has been moved to Fantasy_Football_Analysis.ipynb
 # For standalone usage, see function docstrings above.
+
 

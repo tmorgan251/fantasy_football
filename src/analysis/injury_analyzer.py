@@ -106,7 +106,7 @@ class InjuryAnalyzer:
             injury_file = self.injury_dir / f"nfl_injuries_{year}.csv"
             if not injury_file.exists():
                 if self.verbose:
-                    print(f"  ⚠ Injury file not found for {year}: {injury_file}")
+                    print(f"  Warning: Injury file not found for {year}: {injury_file}")
                 continue
             
             df = pd.read_csv(injury_file)
@@ -235,7 +235,7 @@ class InjuryAnalyzer:
                             print(f"  ✓ Loaded {len(df):,} records from {year_dir.name}")
                     except Exception as e:
                         if self.verbose:
-                            print(f"  ⚠️  Error loading {year_dir.name}: {e}")
+                            print(f"  Warning: Error loading {year_dir.name}: {e}")
                         continue
             
             if not all_lineups:
@@ -272,8 +272,6 @@ class InjuryAnalyzer:
         Baseline = average (actual - projected) points when player has no injury.
         Used to compare injured performance against their normal healthy performance.
         
-        Uses vectorized groupby operations instead of slow per-player loops.
-        
         Returns:
             DataFrame: player_norm, position, baseline_avg, baseline_std, n_weeks
         """
@@ -302,12 +300,15 @@ class InjuryAnalyzer:
         # Only use healthy weeks to calculate baseline
         healthy_weeks = merged[~merged['has_injury']].copy()
         
-        # Calculate mean, std, and count for each player's healthy weeks (vectorized - fast!)
+        # Calculate mean, std, and count for each player's healthy weeks
+        # agg() with list of functions: Applies multiple aggregations to same column
+        # ['mean', 'std', 'count'] creates multi-level columns that we flatten below
         baselines = healthy_weeks.groupby('player_norm').agg({
             'point_differential': ['mean', 'std', 'count'],
-            'Position': 'first'
+            'Position': 'first'  # 'first' gets first value (all should be same for a player)
         }).reset_index()
         
+        # Flatten multi-level column names created by multiple aggregations
         baselines.columns = ['player_norm', 'baseline_avg', 'baseline_std', 'n_weeks', 'position']
         baselines['baseline_std'] = baselines['baseline_std'].fillna(0.0)  # Single data point = 0 std
         
@@ -415,6 +416,8 @@ class InjuryAnalyzer:
             'baseline_avg', 'baseline_std', 'n_weeks'
         ]
         # Only select columns that exist
+        # List comprehension: Filter to only columns that exist in the DataFrame
+        # Prevents KeyError if a column doesn't exist in the data
         available_cols = [col for col in analysis_cols if col in df.columns]
         analysis_df = df[available_cols].copy()
         
@@ -430,10 +433,9 @@ class InjuryAnalyzer:
     
     def compute_aggregated_stats(self, analysis_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
         """
-        Compute aggregated statistics using fast vectorized groupby operations.
+        Compute aggregated statistics grouped by injury type, status, and position.
         
-        Replaces slow nested loops with single groupby().agg() call. Groups by
-        injury type, status, and position to calculate means, counts, and standard deviations.
+        Groups by injury type, status, and position to calculate means, counts, and standard deviations.
         
         Args:
             analysis_df: Optional pre-prepared DataFrame. If None, prepares it automatically.
@@ -442,7 +444,7 @@ class InjuryAnalyzer:
             DataFrame with aggregated statistics (mean, std, count per combination)
         """
         if self.verbose:
-            print("\nComputing aggregated statistics (vectorized)...")
+            print("\nComputing aggregated statistics...")
             import time
             start_time = time.time()
         
@@ -458,17 +460,20 @@ class InjuryAnalyzer:
         
         if len(injured_df) == 0:
             if self.verbose:
-                print("  ⚠️  No injured player-weeks found")
+                print("  Warning: No injured player-weeks found")
             return pd.DataFrame()
         
-        # VECTORIZED: Single groupby operation instead of nested loops
+        # Group by injury type, position, and status to calculate aggregated stats
         agg_stats = injured_df.groupby(['injury_type', 'position', 'injury_status']).agg({
             'point_differential': ['mean', 'median', 'std', 'count'],
             'vs_baseline': ['mean', 'median'],
             'player_norm': 'nunique'  # Count unique players
         }).reset_index()
         
-        # Flatten column names
+        # Flatten multi-level column names created by multiple aggregations
+        # When you use agg() with multiple functions on same column, pandas creates
+        # MultiIndex columns like ('point_differential', 'mean'), ('point_differential', 'std')
+        # This flattens them to simple column names
         agg_stats.columns = [
             'injury_type', 'position', 'injury_status',
             'avg_point_differential', 'median_point_differential', 
@@ -490,9 +495,6 @@ class InjuryAnalyzer:
         """
         Perform comprehensive injury impact analysis.
         
-        OPTIMIZED: Uses vectorized operations instead of nested loops.
-        Can be run in chunks if chunked=True.
-        
         Args:
             chunked: If True, returns partial results for chunked processing
         
@@ -507,7 +509,7 @@ class InjuryAnalyzer:
         # Step 1: Prepare data (fast)
         analysis_df = self.prepare_analysis_data()
         
-        # Step 2: Compute aggregated stats (now vectorized - much faster!)
+        # Step 2: Compute aggregated stats
         agg_stats_df = self.compute_aggregated_stats(analysis_df)
         
         if self.verbose:
@@ -887,6 +889,8 @@ class InjuryAnalyzer:
             
             bp = ax4.boxplot(box_data, labels=labels_with_n, patch_artist=True)
             # Color boxes: green for healthy, red shades for injured
+            # List comprehension: Set color based on label content
+            # 'lightgreen' for healthy players, 'lightcoral' for injured players
             colors = ['lightgreen' if 'No Injury' in label else 'lightcoral' for label in box_labels]
             for patch, color in zip(bp['boxes'], colors):
                 patch.set_facecolor(color)
@@ -940,7 +944,7 @@ class InjuryAnalyzer:
         self.load_injury_data()
         self.load_lineup_data()
         
-        # Step 2: Calculate baselines (now optimized - much faster!)
+        # Step 2: Calculate baselines
         if self.verbose:
             print("\n[Step 2/4] Calculating player baselines...")
         self.calculate_player_baselines()
@@ -1030,6 +1034,8 @@ class InjuryAnalyzer:
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
         
         # Top N best (positive impact)
+        # List comprehension: Green for positive impact, gray for negative/zero
+        # Positive means player performed better than expected when injured
         colors_best = ['green' if x > 0 else 'gray' for x in top_best['avg_point_differential']]
         bars1 = ax1.barh(range(len(top_best)), top_best['avg_point_differential'], color=colors_best, alpha=0.7)
         ax1.set_yticks(range(len(top_best)))
@@ -1047,6 +1053,8 @@ class InjuryAnalyzer:
                     va='center', ha='left' if val >= 0 else 'right', fontsize=8)
         
         # Top N worst (negative impact)
+        # List comprehension: Red for negative impact, gray for positive/zero
+        # Negative means player performed worse than expected when injured
         colors_worst = ['red' if x < 0 else 'gray' for x in top_worst['avg_point_differential']]
         bars2 = ax2.barh(range(len(top_worst)), top_worst['avg_point_differential'], color=colors_worst, alpha=0.7)
         ax2.set_yticks(range(len(top_worst)))
