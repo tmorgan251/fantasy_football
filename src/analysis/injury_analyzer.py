@@ -55,6 +55,7 @@ class InjuryAnalyzer:
             script_dir = Path(__file__).parent
             project_root = script_dir.parent.parent
             # Check if there's a single file or year-specific files
+            # TODO: Should get rid of this and just use the year-specific files. Other path is no longer valid
             potential_paths = [
                 project_root / "data" / "raw" / "espn" / "lineup_data.csv",
                 project_root / "data" / "raw" / "espn" / "2024" / "lineup_data.csv"
@@ -111,7 +112,7 @@ class InjuryAnalyzer:
             
             df = pd.read_csv(injury_file)
             if self.verbose:
-                print(f"  ✓ Loaded {len(df):,} records from {year}")
+                print(f"  Loaded {len(df):,} records from {year}")
             all_injuries.append(df)
         
         if not all_injuries:
@@ -232,7 +233,7 @@ class InjuryAnalyzer:
                         df['Year'] = year
                         all_lineups.append(df)
                         if self.verbose:
-                            print(f"  ✓ Loaded {len(df):,} records from {year_dir.name}")
+                            print(f"  Loaded {len(df):,} records from {year_dir.name}")
                     except Exception as e:
                         if self.verbose:
                             print(f"  Warning: Error loading {year_dir.name}: {e}")
@@ -314,7 +315,7 @@ class InjuryAnalyzer:
         
         if self.verbose:
             elapsed = time.time() - start_time
-            print(f"  ✓ Calculated baselines for {len(baselines):,} players in {elapsed:.1f} seconds")
+            print(f"  Calculated baselines for {len(baselines):,} players in {elapsed:.1f} seconds")
             print(f"  Average baseline: {baselines['baseline_avg'].mean():.2f} points")
             print(f"  Players with 1+ healthy weeks: {(baselines['n_weeks'] >= 1).sum():,}")
             print(f"  Players with 5+ healthy weeks: {(baselines['n_weeks'] >= 5).sum():,}")
@@ -427,7 +428,7 @@ class InjuryAnalyzer:
         
         if self.verbose:
             elapsed = time.time() - start_time
-            print(f"  ✓ Prepared {len(analysis_df):,} records in {elapsed:.1f} seconds")
+            print(f"  Prepared {len(analysis_df):,} records in {elapsed:.1f} seconds")
         
         return analysis_df
     
@@ -487,7 +488,7 @@ class InjuryAnalyzer:
         
         if self.verbose:
             elapsed = time.time() - start_time
-            print(f"  ✓ Computed {len(agg_stats):,} aggregated statistics in {elapsed:.1f} seconds")
+            print(f"  Computed {len(agg_stats):,} aggregated statistics in {elapsed:.1f} seconds")
         
         return agg_stats
     
@@ -514,7 +515,7 @@ class InjuryAnalyzer:
         
         if self.verbose:
             elapsed = time.time() - start_time
-            print(f"  ✓ Analysis complete in {elapsed:.1f} seconds")
+            print(f"  Analysis complete in {elapsed:.1f} seconds")
             print(f"  Aggregated statistics: {len(agg_stats_df):,} combinations")
             print(f"  Individual records: {len(analysis_df):,}")
         
@@ -977,8 +978,8 @@ class InjuryAnalyzer:
             individual_records.to_csv(individual_path, index=False)
             
             if self.verbose:
-                print(f"\n✓ Saved aggregated stats to: {agg_path}")
-                print(f"✓ Saved individual records to: {individual_path}")
+                print(f"\nSaved aggregated stats to: {agg_path}")
+                print(f"Saved individual records to: {individual_path}")
         
         if self.verbose:
             pipeline_elapsed = time.time() - pipeline_start

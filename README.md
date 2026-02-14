@@ -15,12 +15,47 @@ This project analyzes fantasy football data to identify the most meaningful elem
 
 - **Draft Advantage**: Human drafters show measurable advantages over autodraft in early rounds, with diminishing returns in later rounds.
 - **Injury Impact**: Certain injury types (e.g., hamstring) have position-specific impacts that significantly affect point differentials.
-- **Decision Support**: Our analysis provides actionable insights for draft strategy and weekly lineup decisions.
+- **Waiver Wire Value**: Waiver wire decisions contribute meaningful points throughout the season, with Q25 baseline providing minimal competency threshold.
+- **Start/Sit Quality**: Managers generally make good lineup choices relative to projections, with start/sit decisions compounding weekly.
+- **Cumulative Impact**: All three decision points (Draft, Waiver, Start/Sit) contribute meaningfully to overall team performance.
+- **Decision Support**: Our analysis provides actionable insights for draft strategy, waiver wire management, and weekly lineup decisions.
 
 ## Data Sources
 
 - **ESPN Fantasy Football API**: Historical league data (2021-2024) including drafts, lineups, and transactions
 - **NFL Injury Database (nfl_data_py)**: Player injury reports with type, status, and timing
+
+## Analysis Components
+
+### 1. Draft Value Analysis
+Quantifies the value of human draft decisions using autodrafted teams as a baseline. Includes:
+- Expected value calculations (per-year, pooled denoised, polynomial baselines)
+- Points added over expected by pick, round, position, and year
+- Human advantage visualizations
+
+### 2. Injury Impact Analysis
+Measures how injuries affect player performance by:
+- Matching injuries to lineup data by player name and week
+- Calculating point differentials (actual - projected) for injured vs healthy players
+- Analyzing impact by injury type, status, and position
+
+### 3. Waiver Wire Baseline Analysis
+Establishes baselines for waiver wire acquisitions:
+- Tracks player stints (add week to drop week)
+- Counts only points when player was in optimal lineup
+- Compares to minimal competency baseline (Q25 of team-season waiver rates)
+
+### 4. Start/Sit Baseline Analysis
+Measures quality of weekly lineup decisions:
+- Compares actual starter points to projected-optimal lineup points
+- Uses projected points (not hindsight) for fair baseline
+- Filters to complete team-weeks for accuracy
+
+### 5. Combined Baseline Analysis
+Integrates all decision points to show cumulative points added over a season:
+- Draft decisions (Week 0)
+- Waiver wire activity (Weeks 1-17)
+- Start/sit decisions (Weeks 1-17)
 
 ## Project Structure
 
@@ -283,6 +318,87 @@ Bar chart showing the top N best and worst performing injury combinations.
 
 ---
 
+### Waiver Wire Baseline Visualizations
+
+#### `plot_waiver_baseline_exploration()`
+
+Exploration visuals for waiver baseline candidates, showing distribution of team-season waiver rates and yearly trends.
+
+**Parameters:**
+- `team_season` (DataFrame): Team-season waiver rate data from `compute_waiver_baseline_candidates()`
+- `baseline_candidates` (dict): Dictionary of baseline name -> value from `compute_waiver_baseline_candidates()`
+- `waiver_baseline_name` (str, default="q25_team_season"): Name of selected baseline to highlight
+
+**Returns:** None (displays plots)
+
+---
+
+#### `plot_draft_vs_waiver_points()`
+
+Plot cumulative draft vs waiver points added over time. Draft points assigned to Week 0, waiver points by week.
+
+**Parameters:**
+- `draft_scored` (DataFrame): Scored draft data with points added columns
+- `waiver_stints` (DataFrame): Waiver stints from `build_waiver_add_stints()`
+- `optimal_selected` (DataFrame): Optimal lineup selections from `compute_optimal_startable_points()`
+- `waiver_baseline_value` (float): Baseline value for waiver points (from `compute_waiver_baseline_candidates()`)
+- `draft_points_col` (str, default="Points_Added_Poly"): Column name for draft points ("Points_Added_Poly" or "Points_Added_Pooled")
+- `manual_draft_only` (bool, default=True): Only include manual draft picks (exclude autodrafted)
+- `season_end_week` (int, default=17): Last week of season
+- `ignore_weeks` (set, default={15}): Set of weeks to exclude from analysis
+- `agg_mode` (str, default="mean_per_team_season"): Aggregation mode - "total" or "mean_per_team_season"
+
+**Returns:** None (displays plot)
+
+---
+
+#### `plot_yearly_draft_waiver_totals()`
+
+Plot yearly total points added over expected for Draft + Waiver, comparing multiple baseline options.
+
+**Parameters:**
+- `draft_scored` (DataFrame): Scored draft data
+- `waiver_with_valid` (DataFrame): Waiver data with valid points from `compute_valid_waiver_points()`
+- `baseline_candidates` (dict): Dictionary of baseline candidates
+- `manual_draft_only` (bool, default=True): Only include manual draft picks
+
+**Returns:** DataFrame with yearly totals summary
+
+---
+
+### Start/Sit Baseline Visualizations
+
+#### `plot_startsit_by_year()`
+
+Plot average Start/Sit points added by year using projected-optimal baseline.
+
+**Parameters:**
+- `startsit_weekly_clean` (DataFrame): Clean start/sit weekly data from `compute_startsit_metrics()`
+
+**Returns:** DataFrame with yearly summary statistics
+
+---
+
+#### `plot_cumulative_draft_waiver_startsit()`
+
+Plot cumulative points added: Draft + Waiver + Start/Sit over the course of a season.
+
+**Parameters:**
+- `draft_scored` (DataFrame): Scored draft data
+- `waiver_stints` (DataFrame): Waiver stints from `build_waiver_add_stints()`
+- `optimal_selected` (DataFrame): Optimal lineup selections
+- `startsit_weekly_clean` (DataFrame): Clean start/sit weekly data
+- `waiver_baseline_value` (float): Baseline value for waiver points
+- `draft_points_col` (str, default="Points_Added_Poly"): Column name for draft points
+- `manual_draft_only` (bool, default=True): Only include manual draft picks
+- `season_end_week` (int, default=17): Last week of season
+- `ignore_weeks` (set, default={15}): Set of weeks to exclude
+- `agg_mode` (str, default="mean_per_team_season"): Aggregation mode
+
+**Returns:** None (displays plot)
+
+---
+
 ## Usage Examples
 
 ### Draft Value Analysis
@@ -335,6 +451,58 @@ injury_analyzer.plot_point_differential_distribution()
 injury_analyzer.plot_top_injury_impacts(top_n=10)
 ```
 
+### Waiver Wire Baseline Analysis
+
+```python
+from src.analysis.draft_value_analyzer import DraftValueAnalyzer
+
+# Initialize analyzer (assuming you already have draft analysis completed)
+analyzer = DraftValueAnalyzer(...)
+
+# Load transaction data
+transactions_raw = analyzer.load_multi_season_transactions(lineups_filt=lineups_filt)
+
+# Build waiver stints
+waiver_stints = analyzer.build_waiver_add_stints(
+    transactions_raw,
+    season_end_week=17,
+    min_week_after_add=1
+)
+
+# Compute valid waiver points
+waiver_with_valid = analyzer.compute_valid_waiver_points(waiver_stints, optimal_selected)
+
+# Compute baseline candidates
+baseline_candidates, team_season = analyzer.compute_waiver_baseline_candidates(waiver_with_valid)
+WAIVER_BASELINE_VALUE = baseline_candidates["q25_team_season"]
+
+# Create visualizations
+analyzer.plot_waiver_baseline_exploration(team_season, baseline_candidates)
+analyzer.plot_draft_vs_waiver_points(
+    draft_scored, waiver_stints, optimal_selected, WAIVER_BASELINE_VALUE
+)
+analyzer.plot_yearly_draft_waiver_totals(draft_scored, waiver_with_valid, baseline_candidates)
+```
+
+### Start/Sit Baseline Analysis
+
+```python
+# Compute start/sit metrics
+startsit_weekly, startsit_weekly_clean = analyzer.compute_startsit_metrics(
+    lineups_filt,
+    slot_counts={"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1, "K": 1, "D/ST": 1},
+    flex_eligible={"RB", "WR", "TE"}
+)
+
+# Create visualizations
+analyzer.plot_startsit_by_year(startsit_weekly_clean)
+
+# Combined analysis
+analyzer.plot_cumulative_draft_waiver_startsit(
+    draft_scored, waiver_stints, optimal_selected, startsit_weekly_clean, WAIVER_BASELINE_VALUE
+)
+```
+
 ## Notes
 
 - All visualization methods return matplotlib Figure objects (except those that return DataFrames)
@@ -348,14 +516,19 @@ injury_analyzer.plot_top_injury_impacts(top_n=10)
 2. **Injury Data Quality**: Injury reports may not capture all injuries or may include non-injury designations (e.g., rest days).
 3. **Projection Accuracy**: Analysis assumes ESPN projections are reasonable baselines. Actual projection quality may vary.
 4. **Sample Size**: Some injury type/position combinations have limited data (<30 observations), requiring population thresholds.
+5. **Transaction Data**: Waiver wire analysis depends on accurate transaction data. Missing or incomplete transaction records may affect results.
+6. **Complete Weeks**: Start/sit analysis filters to complete team-weeks only, which may exclude some valid decision scenarios (e.g., strategic bench decisions).
+7. **Baseline Assumptions**: Baselines (autodraft, Q25 waiver rate, projected-optimal) represent minimal competency thresholds and may not reflect optimal strategies.
 
 ## Future Work
 
 1. **Machine Learning Models**: Develop predictive models that combine draft position, injury status, and historical performance to optimize draft and lineup decisions.
-2. **Real-Time Decision Support**: Create a tool that provides real-time recommendations during drafts and weekly lineup decisions based on this analysis.
+2. **Real-Time Decision Support**: Create a tool that provides real-time recommendations during drafts, waiver wire decisions, and weekly lineup decisions based on this analysis.
 3. **Expanded Data Sources**: Incorporate additional data sources (e.g., weather, opponent strength, player snap counts) to improve injury impact predictions.
-4. **Longitudinal Analysis**: Track how injury impacts change over multiple weeks to identify recovery patterns and optimal return-to-play timing.
+4. **Trade Analysis**: Extend baseline analysis to include trade decisions, completing the four-baseline framework (Draft, Waiver, Trade, Start/Sit).
 5. **Platform Comparison**: Extend analysis to other fantasy platforms (Yahoo, Sleeper) to validate generalizability of findings.
+6. **Advanced Waiver Analysis**: Incorporate waiver wire priority, FAAB bidding, and timing analysis to better understand waiver wire strategy.
+7. **Start/Sit Optimization**: Develop models that predict optimal start/sit decisions based on matchups, weather, and other contextual factors.
 
 ## Disclaimer
 

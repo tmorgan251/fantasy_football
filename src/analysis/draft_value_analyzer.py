@@ -86,6 +86,8 @@ class DraftValueAnalyzer:
         self.draft_enriched = None
         self.draft_with_valid = None
         self.draft_scored = None
+        self.lineups_filt = None  # Filtered lineups (for waiver wire, start/sit analysis)
+        self.optimal_selected = None  # Optimal lineup selections (for waiver wire, start/sit analysis)
         
     # ==================== UTILITY METHODS ====================
     
@@ -853,6 +855,9 @@ class DraftValueAnalyzer:
         if filter_draft_length:
             draft_filt, lineups_filt = self.filter_draft_length(draft_filt, lineups_filt)
         
+        # Store filtered lineups for later use (waiver wire, start/sit analysis)
+        self.lineups_filt = lineups_filt
+        
         # Step 7: Enrich draft data
         draft_enriched = self.enrich_draft_data(draft_filt, lineups_filt)
         
@@ -869,6 +874,9 @@ class DraftValueAnalyzer:
                 slot_counts={"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1, "K": 1, "D/ST": 1},
                 flex_eligible={"RB", "WR", "TE"}
             )
+            
+            # Store optimal selections for later use (waiver wire, start/sit analysis)
+            self.optimal_selected = optimal_selected
             
             # Step 9: Add valid points
             draft_with_valid = self.add_valid_points(draft_enriched, optimal_selected)
@@ -1592,4 +1600,828 @@ class DraftValueAnalyzer:
             .sort_values(["Year", "Overall"])
         )
         return dist
+    
+    # ==================== WAIVER WIRE BASELINE METHODS ====================
+    
+    def build_waiver_add_stints(
+        self,
+        transactions: pd.DataFrame,
+        *,
+        season_end_week: int = 17,
+        include_actions: Optional[Set[str]] = None,
+        drop_actions: Optional[Set[str]] = None,
+        min_week_after_add: int = 0
+    ) -> pd.DataFrame:
+        """
+        Build waiver add stints from transaction data.
+        
+        For each waiver/free-agent add, finds the next drop of that same player
+        by that same team in the same league-year. Creates stints representing
+        the period from add week to drop week (or season end if never dropped).
+        
+        Args:
+            transactions: DataFrame with columns: League_ID, Year, Week, Team, Player_norm, Action_norm
+            season_end_week: Last week of the season (default: 17)
+            include_actions: Set of action types to consider as adds (default: {"WAIVER_ADD", "FREEAGENT_ADD"})
+            drop_actions: Set of action types to consider as drops (default: {"DROP"})
+            min_week_after_add: Minimum weeks after add before counting points (default: 0)
+        
+        Returns:
+            DataFrame with columns: League_ID, Year, Team, Player_norm, Add_Week,
+            Start_Week_For_Credit, End_Week, Add_Type
+        """
+        if include_actions is None:
+            include_actions = {"WAIVER_ADD", "FREEAGENT_ADD"}
+        if drop_actions is None:
+            drop_actions = {"DROP"}
+        
+        df = transactions.copy()
+        required = {"League_ID", "Year", "Week", "Team", "Player_norm", "Action_norm"}
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(f"transactions missing columns: {sorted(missing)}")
+        
+        adds = df[df["Action_norm"].isin(include_actions)].copy()
+        drops = df[df["Action_norm"].isin(drop_actions)].copy()
+        
+        if adds.empty:
+            raise ValueError("No waiver/free-agent add events found after filtering.")
+        
+        # For each add, find the next drop of that same player by that same team in same league-year
+        adds = adds.sort_values(["League_ID", "Year", "Team", "Player_norm", "Week"]).reset_index(drop=True)
+        adds["Add_ID"] = np.arange(len(adds), dtype=int)
+        
+        cand = adds.merge(
+            drops[["League_ID", "Year", "Team", "Player_norm", "Week"]].rename(columns={"Week": "Drop_Week"}),
+            on=["League_ID", "Year", "Team", "Player_norm"],
+            how="left"
+        )
+        
+        cand = cand[cand["Drop_Week"].isna() | (cand["Drop_Week"] >= cand["Week"])].copy()
+        
+        next_drop = (
+            cand.groupby("Add_ID", dropna=False)["Drop_Week"]
+            .min()
+            .reset_index()
+        )
+        
+        adds = adds.merge(next_drop, on="Add_ID", how="left")
+        adds["Add_Week"] = pd.to_numeric(adds["Week"], errors="coerce").astype(int)
+        adds["Drop_Week"] = pd.to_numeric(adds["Drop_Week"], errors="coerce")
+        
+        # End week: drop_week - 1 if drop exists, else season end
+        adds["End_Week"] = np.where(
+            adds["Drop_Week"].notna(),
+            adds["Drop_Week"] - 1,
+            int(season_end_week)
+        ).astype(int)
+        
+        # Optional conservative rule: don't count the add week itself
+        adds["Start_Week_For_Credit"] = adds["Add_Week"] + int(min_week_after_add)
+        
+        out = adds[["League_ID", "Year", "Team", "Player_norm", "Add_Week", "Start_Week_For_Credit", "End_Week", "Action_norm"]].copy()
+        out = out.rename(columns={"Action_norm": "Add_Type"})
+        
+        # Sanity clamp
+        out["End_Week"] = out["End_Week"].clip(lower=0, upper=season_end_week)
+        out = out[out["End_Week"] >= out["Start_Week_For_Credit"]].copy()
+        
+        return out
+    
+    def compute_valid_waiver_points(
+        self,
+        waiver_stints: pd.DataFrame,
+        optimal_selected: pd.DataFrame
+    ) -> pd.DataFrame:
+        """
+        Compute valid waiver points for each stint using optimal lineup selections.
+        
+        Valid points are only counted when the player was selected in the optimal lineup
+        during their stint window. Aggregates to stint-level totals.
+        
+        Args:
+            waiver_stints: DataFrame from build_waiver_add_stints with columns:
+                League_ID, Year, Team, Player_norm, Start_Week_For_Credit, End_Week, Add_Week, Add_Type
+            optimal_selected: DataFrame from compute_optimal_startable_points with columns:
+                League_ID, Year, Team, Week, Player_norm, WeekPoints, SelectedOptimal, Position
+        
+        Returns:
+            DataFrame with columns: League_ID, Year, Team, Player_norm, Add_Week,
+            Start_Week_For_Credit, End_Week, Add_Type, Position, Valid_Points, Weeks_Observed
+        """
+        req_s = {"League_ID", "Year", "Team", "Player_norm", "Start_Week_For_Credit", "End_Week", "Add_Week", "Add_Type"}
+        missing = req_s - set(waiver_stints.columns)
+        if missing:
+            raise ValueError(f"waiver_stints missing columns: {sorted(missing)}")
+        
+        req_o = {"League_ID", "Year", "Team", "Week", "Player_norm", "WeekPoints", "SelectedOptimal", "Position"}
+        missing = req_o - set(optimal_selected.columns)
+        if missing:
+            raise ValueError(f"optimal_selected missing columns: {sorted(missing)}")
+        
+        osel = optimal_selected.copy()
+        osel["Week"] = pd.to_numeric(osel["Week"], errors="coerce").astype(int)
+        osel["WeekPoints"] = pd.to_numeric(osel["WeekPoints"], errors="coerce").fillna(0.0)
+        osel["ValidWeekPoints"] = np.where(osel["SelectedOptimal"].astype(bool), osel["WeekPoints"], 0.0)
+        
+        # Join stints to weekly player rows (same league-year-team-player)
+        joined = waiver_stints.merge(
+            osel[["League_ID", "Year", "Team", "Week", "Player_norm", "Position", "ValidWeekPoints"]],
+            on=["League_ID", "Year", "Team", "Player_norm"],
+            how="left"
+        )
+        
+        # Keep only weeks in stint window
+        joined = joined[
+            (joined["Week"].notna()) &
+            (joined["Week"].astype(int) >= joined["Start_Week_For_Credit"].astype(int)) &
+            (joined["Week"].astype(int) <= joined["End_Week"].astype(int))
+        ].copy()
+        
+        # Aggregate to stint
+        stint_points = (
+            joined.groupby(["League_ID", "Year", "Team", "Player_norm", "Add_Week", "Start_Week_For_Credit", "End_Week", "Add_Type", "Position"], dropna=False)
+            .agg(
+                Valid_Points=("ValidWeekPoints", "sum"),
+                Weeks_Observed=("Week", "nunique"),
+            )
+            .reset_index()
+        )
+        
+        # Add explicit zeros for stints where player never appeared in optimal_selected
+        out = waiver_stints.merge(
+            stint_points,
+            on=["League_ID", "Year", "Team", "Player_norm", "Add_Week", "Start_Week_For_Credit", "End_Week", "Add_Type"],
+            how="left"
+        )
+        out["Valid_Points"] = pd.to_numeric(out["Valid_Points"], errors="coerce").fillna(0.0)
+        out["Weeks_Observed"] = pd.to_numeric(out["Weeks_Observed"], errors="coerce").fillna(0).astype(int)
+        out["Position"] = out["Position"].fillna("UNKNOWN")
+        
+        return out
+    
+    def load_transactions(self, path: Path, year: int) -> pd.DataFrame:
+        """
+        Load and normalize transaction data for a single year.
+        
+        Args:
+            path: Path to transaction_data.csv
+            year: Year of the data
+        
+        Returns:
+            DataFrame with normalized transaction data
+        """
+        df = pd.read_csv(path)
+        required = ["League_ID", "Week", "Team", "Player", "Action"]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise ValueError(f"{path} transaction_data is missing columns: {missing}")
+        
+        df = df.copy()
+        df["Year"] = int(year)
+        df["League_ID"] = df["League_ID"].astype(int)
+        df["Year"] = df["Year"].astype(int)
+        df["Week"] = pd.to_numeric(df["Week"], errors="coerce").astype(int)
+        df["Team"] = pd.to_numeric(df["Team"], errors="coerce").astype(int)
+        
+        df["Player_norm"] = df["Player"].map(lambda x: self.normalize_player_name(x, self.anchor_synonyms))
+        df["Action_norm"] = df["Action"].astype(str).str.strip().str.upper()
+        
+        return df
+    
+    def load_multi_season_transactions(self, lineups_filt: pd.DataFrame = None) -> pd.DataFrame:
+        """
+        Load transaction data across multiple seasons.
+        
+        Args:
+            lineups_filt: Filtered lineup data to match league-years (optional)
+        
+        Returns:
+            DataFrame with all transaction data
+        """
+        if self.verbose:
+            print("\n=== Loading Multi-Season Transaction Data ===")
+        
+        parts = []
+        for year_dir in sorted([
+            p for p in self.raw_base.iterdir()
+            if p.is_dir() and p.name.isdigit() and len(p.name) == 4
+        ]):
+            year = int(year_dir.name)
+            if year not in self.years:
+                continue
+            
+            tpath = year_dir / "transaction_data.csv"
+            if tpath.exists():
+                parts.append(self.load_transactions(tpath, year))
+            else:
+                if self.verbose:
+                    print(f"Skipping {year}: missing {tpath}")
+        
+        if not parts:
+            raise FileNotFoundError(f"No transaction_data.csv found under {self.raw_base}/<YEAR>/transaction_data.csv")
+        
+        transactions_all = pd.concat(parts, ignore_index=True)
+        
+        # Filter to same league-years as lineups if provided
+        if lineups_filt is not None:
+            kept_league_years = lineups_filt[["League_ID", "Year"]].drop_duplicates()
+            transactions_all = transactions_all.merge(kept_league_years, on=["League_ID", "Year"], how="inner")
+            if self.verbose:
+                print(f"Filtered to {len(transactions_all):,} transaction rows across {len(kept_league_years):,} league-years")
+        
+        if self.verbose:
+            print(f"Loaded {len(transactions_all):,} transaction records")
+        
+        return transactions_all
+    
+    def compute_waiver_baseline_candidates(
+        self,
+        waiver_with_valid: pd.DataFrame
+    ) -> Tuple[Dict[str, float], pd.DataFrame]:
+        """
+        Compute waiver baseline candidates using minimal competency framing.
+        
+        Calculates multiple baseline options (mean, median, Q25) for waiver wire performance.
+        The Q25 baseline represents minimal competency, similar to autodraft baseline.
+        
+        Args:
+            waiver_with_valid: DataFrame from compute_valid_waiver_points with columns:
+                League_ID, Year, Team, Valid_Points, Weeks_Observed
+        
+        Returns:
+            Tuple of (baseline_candidates dict, team_season DataFrame)
+        """
+        w = waiver_with_valid.copy()
+        req = {"League_ID", "Year", "Team", "Valid_Points", "Weeks_Observed"}
+        missing = req - set(w.columns)
+        if missing:
+            raise ValueError(f"waiver_with_valid missing columns: {sorted(missing)}")
+        
+        w["Year"] = pd.to_numeric(w["Year"], errors="coerce").astype(int)
+        w["Valid_Points"] = pd.to_numeric(w["Valid_Points"], errors="coerce").fillna(0.0)
+        w["Weeks_Observed"] = pd.to_numeric(w["Weeks_Observed"], errors="coerce").fillna(0).astype(int)
+        w = w[w["Weeks_Observed"] > 0].copy()
+        
+        if w.empty:
+            raise ValueError("No waiver stints with Weeks_Observed > 0.")
+        
+        w["Stint_Weekly_Rate"] = w["Valid_Points"] / w["Weeks_Observed"]
+        
+        team_season = (
+            w.groupby(["League_ID", "Year", "Team"], dropna=False)
+            .agg(
+                TeamSeason_Valid=("Valid_Points", "sum"),
+                TeamSeason_Weeks=("Weeks_Observed", "sum"),
+            )
+            .reset_index()
+        )
+        team_season = team_season[team_season["TeamSeason_Weeks"] > 0].copy()
+        team_season["TeamSeason_Weekly_Rate"] = team_season["TeamSeason_Valid"] / team_season["TeamSeason_Weeks"]
+        
+        baseline_candidates = {
+            "avg_stint_week": float(w["Valid_Points"].sum() / w["Weeks_Observed"].sum()),
+            "median_team_season": float(team_season["TeamSeason_Weekly_Rate"].median()),
+            "q25_team_season": float(team_season["TeamSeason_Weekly_Rate"].quantile(0.25)),
+        }
+        
+        if self.verbose:
+            print(f"Waiver baseline candidates: {baseline_candidates}")
+            print(f"Zero-rate share among stints: {(w['Stint_Weekly_Rate'] == 0).mean():.1%}")
+        
+        return baseline_candidates, team_season
+    
+    def compute_startsit_metrics(
+        self,
+        lineups_filt: pd.DataFrame,
+        slot_counts: Dict[str, int] = None,
+        flex_eligible: Set[str] = None
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Compute Start/Sit metrics using projected-optimal baseline.
+        
+        Compares actual starter points to projected-optimal lineup points.
+        Only includes complete team-weeks (all expected starters present).
+        
+        Args:
+            lineups_filt: Filtered lineup data with Projected_Points column
+            slot_counts: Position slot requirements (default: standard 1QB/2RB/2WR/1TE/1FLEX/1K/1DST)
+            flex_eligible: Positions eligible for FLEX (default: {"RB", "WR", "TE"})
+        
+        Returns:
+            Tuple of (startsit_weekly DataFrame, startsit_weekly_clean DataFrame)
+            startsit_weekly_clean only includes complete team-weeks
+        """
+        if "Projected_Points" not in lineups_filt.columns:
+            raise ValueError("lineups_filt missing Projected_Points.")
+        
+        if slot_counts is None:
+            slot_counts = {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1, "K": 1, "D/ST": 1}
+        if flex_eligible is None:
+            flex_eligible = {"RB", "WR", "TE"}
+        
+        expected_starter_count = int(self.expected_starters.get("STARTERS", 9))
+        starter_slots = {"QB", "RB", "WR", "TE", "FLEX", "K", "D/ST", "DST", "DEF", "RB/WR/TE", "OP", "SUPERFLEX", "QB/RB/WR/TE"}
+        
+        df = lineups_filt.copy()
+        df["Week"] = pd.to_numeric(df["Week"], errors="coerce")
+        df["Points"] = pd.to_numeric(df["Points"], errors="coerce").fillna(0.0)
+        df["Projected_Points"] = pd.to_numeric(df["Projected_Points"], errors="coerce").fillna(0.0)
+        df["Slot_norm"] = df["Slot"].astype(str).str.upper().str.strip()
+        
+        if "Is_Starter" in df.columns:
+            df["Is_Starter"] = pd.to_numeric(df["Is_Starter"], errors="coerce").fillna(0).astype(int)
+        else:
+            df["Is_Starter"] = 0
+        
+        if "Player_norm" not in df.columns:
+            df["Player_norm"] = df["Player"].astype(str).str.strip()
+        
+        # Robust starter flag: ESPN starter flag OR starter-typed slot
+        df["Is_Starter_Robust"] = (df["Is_Starter"].eq(1) | df["Slot_norm"].isin(starter_slots)).astype(int)
+        
+        # Position inference
+        pos = self._infer_player_position_by_core_starts(df[["League_ID", "Year", "Team", "Slot", "Player_norm"]].copy())
+        
+        # One row per player-week with actual + projected
+        pw = (
+            df.groupby(["League_ID", "Year", "Team", "Week", "Player_norm"], dropna=False)
+            .agg(
+                ActualWeekPoints=("Points", "max"),
+                ProjWeekPoints=("Projected_Points", "max"),
+            )
+            .reset_index()
+        )
+        pw = pw.merge(pos, on=["League_ID", "Year", "Team", "Player_norm"], how="left")
+        pw["Position"] = pw["Position"].fillna("UNKNOWN")
+        
+        # Projection-optimal lineup selection (by projected points)
+        selected_parts = []
+        for _, g in pw.groupby(["League_ID", "Year", "Team", "Week"], sort=False):
+            work = g.copy().rename(columns={"ProjWeekPoints": "WeekPoints"})
+            work_sel = self._choose_optimal_lineup_for_group(work, slot_counts, flex_eligible)
+            selected_parts.append(work_sel)
+        
+        proj_selected = pd.concat(selected_parts, ignore_index=True)
+        
+        proj_opt_actual = (
+            proj_selected[proj_selected["SelectedOptimal"]]
+            .groupby(["League_ID", "Year", "Team", "Week"], dropna=False)["ActualWeekPoints"]
+            .sum()
+            .reset_index(name="ProjOptimal_ActualPoints")
+        )
+        proj_opt_proj = (
+            proj_selected[proj_selected["SelectedOptimal"]]
+            .groupby(["League_ID", "Year", "Team", "Week"], dropna=False)["WeekPoints"]
+            .sum()
+            .reset_index(name="ProjOptimal_ProjectedPoints")
+        )
+        proj_opt_n = (
+            proj_selected[proj_selected["SelectedOptimal"]]
+            .groupby(["League_ID", "Year", "Team", "Week"], dropna=False)
+            .size().reset_index(name="ProjOptimal_Selected_Count")
+        )
+        
+        # Actual starter totals using robust starter flag
+        actual_wk = (
+            df[df["Is_Starter_Robust"] == 1]
+            .groupby(["League_ID", "Year", "Team", "Week"], dropna=False)
+            .agg(
+                Actual_Starter_Points=("Points", "sum"),
+                Actual_Starter_ProjectedPoints=("Projected_Points", "sum"),
+                Actual_Starter_Count=("Player_norm", "nunique"),
+            )
+            .reset_index()
+        )
+        
+        startsit_weekly = (
+            actual_wk
+            .merge(proj_opt_actual, on=["League_ID", "Year", "Team", "Week"], how="outer")
+            .merge(proj_opt_proj, on=["League_ID", "Year", "Team", "Week"], how="outer")
+            .merge(proj_opt_n, on=["League_ID", "Year", "Team", "Week"], how="outer")
+            .fillna(0.0)
+        )
+        startsit_weekly["StartSit_PA"] = startsit_weekly["Actual_Starter_Points"] - startsit_weekly["ProjOptimal_ActualPoints"]
+        startsit_weekly["StartSit_ProjGap"] = startsit_weekly["Actual_Starter_ProjectedPoints"] - startsit_weekly["ProjOptimal_ProjectedPoints"]
+        
+        # Keep only complete team-weeks for Start/Sit scoring
+        startsit_weekly["Lineup_Complete"] = startsit_weekly["Actual_Starter_Count"].eq(expected_starter_count)
+        startsit_weekly["Proj_Complete"] = startsit_weekly["ProjOptimal_Selected_Count"].eq(expected_starter_count)
+        startsit_weekly_clean = startsit_weekly[startsit_weekly["Lineup_Complete"] & startsit_weekly["Proj_Complete"]].copy()
+        
+        if self.verbose:
+            print(f"[Start/Sit] Complete team-weeks kept: {len(startsit_weekly_clean):,} / {len(startsit_weekly):,}")
+            print(startsit_weekly_clean[["StartSit_PA", "StartSit_ProjGap"]].describe())
+        
+        return startsit_weekly, startsit_weekly_clean
+    
+    # ==================== WAIVER WIRE VISUALIZATION METHODS ====================
+    
+    def plot_waiver_baseline_exploration(
+        self,
+        team_season: pd.DataFrame,
+        baseline_candidates: Dict[str, float],
+        waiver_baseline_name: str = "q25_team_season"
+    ) -> None:
+        """
+        Plot waiver baseline exploration visuals.
+        
+        Shows distribution of team-season waiver rates with candidate baseline lines,
+        and yearly trend of team-season waiver rates.
+        
+        Args:
+            team_season: DataFrame from compute_waiver_baseline_candidates
+            baseline_candidates: Dict of baseline name -> value
+            waiver_baseline_name: Name of selected baseline (default: "q25_team_season")
+        """
+        waiver_baseline_value = baseline_candidates.get(waiver_baseline_name)
+        if waiver_baseline_value is None:
+            raise ValueError(f"waiver_baseline_name '{waiver_baseline_name}' not in baseline_candidates")
+        
+        # (1) Team-season distribution
+        plt.figure(figsize=(10, 5))
+        plt.hist(team_season["TeamSeason_Weekly_Rate"], bins=60, alpha=0.75, color="#7AA6C2")
+        for name, val in baseline_candidates.items():
+            ls = "-" if name == waiver_baseline_name else "--"
+            lw = 2.5 if name == waiver_baseline_name else 1.5
+            plt.axvline(val, linestyle=ls, linewidth=lw, label=f"{name}: {val:.2f}")
+        plt.xlabel("Team-season waiver valid points per stint-week")
+        plt.ylabel("Count")
+        plt.title("Waiver Baseline Candidate Exploration: Team-Season Distribution")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+        
+        # (2) Yearly trend
+        team_season["Year"] = pd.to_numeric(team_season["Year"], errors="coerce").astype(int)
+        yearly = (
+            team_season.groupby("Year", dropna=False)["TeamSeason_Weekly_Rate"]
+            .agg(["mean", "median", lambda s: s.quantile(0.25)])
+            .reset_index()
+        )
+        yearly.columns = ["Year", "Mean", "Median", "Q25"]
+        
+        plt.figure(figsize=(10, 5))
+        plt.plot(yearly["Year"], yearly["Mean"], marker="o", label="Mean", linewidth=2)
+        plt.plot(yearly["Year"], yearly["Median"], marker="s", label="Median", linewidth=2)
+        plt.plot(yearly["Year"], yearly["Q25"], marker="^", label="Q25", linewidth=2)
+        for name, val in baseline_candidates.items():
+            ls = "-" if name == waiver_baseline_name else "--"
+            plt.axhline(val, linestyle=ls, alpha=0.5, label=f"{name}: {val:.2f}")
+        plt.xlabel("Year")
+        plt.ylabel("Team-season waiver rate")
+        plt.title("Yearly Trend: Team-Season Waiver Rates")
+        plt.legend()
+        plt.grid(alpha=0.2)
+        plt.tight_layout()
+        plt.show()
+    
+    def plot_draft_vs_waiver_points(
+        self,
+        draft_scored: pd.DataFrame,
+        waiver_stints: pd.DataFrame,
+        optimal_selected: pd.DataFrame,
+        waiver_baseline_value: float,
+        draft_points_col: str = "Points_Added_Poly",
+        manual_draft_only: bool = True,
+        season_end_week: int = 17,
+        ignore_weeks: Set[int] = None,
+        agg_mode: str = "mean_per_team_season"
+    ) -> None:
+        """
+        Plot draft vs waiver points added over time.
+        
+        Draft points added assigned to Week 0, waiver points added by week.
+        
+        Args:
+            draft_scored: Scored draft data
+            waiver_stints: Waiver stints DataFrame
+            optimal_selected: Optimal lineup selections
+            waiver_baseline_value: Baseline value for waiver points
+            draft_points_col: Column name for draft points (default: "Points_Added_Poly")
+            manual_draft_only: If True, only include manual draft picks
+            season_end_week: Last week of season (default: 17)
+            ignore_weeks: Set of weeks to ignore (default: {15})
+            agg_mode: Aggregation mode - "total" or "mean_per_team_season" (default)
+        """
+        if ignore_weeks is None:
+            ignore_weeks = {15}
+        
+        d = draft_scored.copy()
+        if manual_draft_only:
+            d = d[d["Is_Autodrafted"] == 0].copy()
+        d[draft_points_col] = pd.to_numeric(d[draft_points_col], errors="coerce").fillna(0.0)
+        draft_total = float(d[draft_points_col].sum())
+        team_seasons_n = d[["League_ID", "Year", "Team"]].drop_duplicates().shape[0]
+        
+        osel = optimal_selected.copy()
+        osel["Week"] = pd.to_numeric(osel["Week"], errors="coerce")
+        osel["WeekPoints"] = pd.to_numeric(osel["WeekPoints"], errors="coerce").fillna(0.0)
+        osel["SelectedOptimal"] = osel["SelectedOptimal"].fillna(False).astype(bool)
+        osel["ValidWeekPoints"] = np.where(osel["SelectedOptimal"], osel["WeekPoints"], 0.0)
+        
+        joined = waiver_stints.merge(
+            osel[["League_ID", "Year", "Team", "Week", "Player_norm", "ValidWeekPoints"]],
+            on=["League_ID", "Year", "Team", "Player_norm"],
+            how="left"
+        )
+        joined = joined[
+            joined["Week"].notna() &
+            (joined["Week"].astype(int) >= joined["Start_Week_For_Credit"].astype(int)) &
+            (joined["Week"].astype(int) <= joined["End_Week"].astype(int))
+        ].copy()
+        joined["Week"] = pd.to_numeric(joined["Week"], errors="coerce").astype(int)
+        joined = joined[(joined["Week"] >= 1) & (joined["Week"] <= season_end_week)].copy()
+        joined = joined[~joined["Week"].isin(ignore_weeks)].copy()
+        
+        waiver_valid_week = joined.groupby("Week", dropna=False)["ValidWeekPoints"].sum().reset_index(name="Waiver_ValidSum")
+        
+        exp_rows = []
+        for _, r in waiver_stints.iterrows():
+            s = int(r["Start_Week_For_Credit"])
+            e = int(r["End_Week"])
+            if e < s:
+                continue
+            s = max(1, s)
+            e = min(season_end_week, e)
+            if e < s:
+                continue
+            exp_rows.extend([wk for wk in range(s, e + 1) if wk not in ignore_weeks])
+        
+        active_stints_week = pd.Series(exp_rows, name="Week").value_counts().rename_axis("Week").reset_index(name="Active_StintWeeks")
+        waiver_week = active_stints_week.merge(waiver_valid_week, on="Week", how="left")
+        waiver_week["Waiver_ValidSum"] = waiver_week["Waiver_ValidSum"].fillna(0.0)
+        waiver_week["Waiver_PointsAdded"] = waiver_week["Waiver_ValidSum"] - waiver_baseline_value * waiver_week["Active_StintWeeks"]
+        
+        weeks = [0] + [wk for wk in range(1, season_end_week + 1) if wk not in ignore_weeks]
+        draft_weekly = pd.Series(0.0, index=weeks)
+        waiver_weekly = pd.Series(0.0, index=weeks)
+        
+        draft_weekly.loc[0] = draft_total
+        for _, r in waiver_week.iterrows():
+            wk = int(r["Week"])
+            if wk in waiver_weekly.index:
+                waiver_weekly.loc[wk] = float(r["Waiver_PointsAdded"])
+        
+        if agg_mode == "mean_per_team_season":
+            draft_weekly /= team_seasons_n
+            waiver_weekly /= team_seasons_n
+        
+        cum_draft = draft_weekly.cumsum()
+        cum_waiver = waiver_weekly.cumsum()
+        cum_total = cum_draft + cum_waiver
+        
+        plt.figure(figsize=(12, 6))
+        plt.plot(cum_draft.index, cum_draft.values, label="Draft (cumulative)", linewidth=2, marker="o")
+        plt.plot(cum_waiver.index, cum_waiver.values, label="Waiver (cumulative)", linewidth=2, marker="s")
+        plt.plot(cum_total.index, cum_total.values, label="Total (cumulative)", linewidth=2, linestyle="--", marker="^")
+        plt.axhline(0, linestyle=":", color="gray", alpha=0.5)
+        plt.xlabel("Week")
+        plt.ylabel(f"Points Added Over Expected ({'per team-season' if agg_mode == 'mean_per_team_season' else 'total'})")
+        plt.title("Cumulative Points Added: Draft vs Waiver")
+        plt.legend()
+        plt.grid(alpha=0.2)
+        plt.tight_layout()
+        plt.show()
+    
+    def plot_yearly_draft_waiver_totals(
+        self,
+        draft_scored: pd.DataFrame,
+        waiver_with_valid: pd.DataFrame,
+        baseline_candidates: Dict[str, float],
+        manual_draft_only: bool = True
+    ) -> pd.DataFrame:
+        """
+        Plot yearly total points added over expected for Draft + Waiver.
+        
+        Args:
+            draft_scored: Scored draft data
+            waiver_with_valid: Waiver data with valid points
+            baseline_candidates: Dict of baseline candidates
+            manual_draft_only: If True, only include manual draft picks
+        
+        Returns:
+            Summary DataFrame with yearly totals
+        """
+        d = draft_scored.copy()
+        d["Year"] = pd.to_numeric(d["Year"], errors="coerce").astype(int)
+        for c in ["Points_Added_Poly", "Points_Added_Pooled"]:
+            d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0.0)
+        if manual_draft_only:
+            d = d[d["Is_Autodrafted"] == 0].copy()
+        
+        d_year = (
+            d.groupby("Year", dropna=False)
+            .agg(
+                Draft_PA_Poly=("Points_Added_Poly", "sum"),
+                Draft_PA_Pooled=("Points_Added_Pooled", "sum"),
+            )
+            .reset_index()
+        )
+        
+        w = waiver_with_valid.copy()
+        w["Year"] = pd.to_numeric(w["Year"], errors="coerce").astype(int)
+        w["Valid_Points"] = pd.to_numeric(w["Valid_Points"], errors="coerce").fillna(0.0)
+        w["Weeks_Observed"] = pd.to_numeric(w["Weeks_Observed"], errors="coerce").fillna(0.0)
+        w = w[w["Weeks_Observed"] > 0].copy()
+        
+        waiver_avg = float(baseline_candidates.get("avg_stint_week", 0))
+        waiver_q25 = float(baseline_candidates.get("q25_team_season", 0))
+        
+        w["Waiver_PA_Avg"] = w["Valid_Points"] - waiver_avg * w["Weeks_Observed"]
+        w["Waiver_PA_Q25"] = w["Valid_Points"] - waiver_q25 * w["Weeks_Observed"]
+        
+        w_year = (
+            w.groupby("Year", dropna=False)
+            .agg(
+                Waiver_PA_Avg=("Waiver_PA_Avg", "sum"),
+                Waiver_PA_Q25=("Waiver_PA_Q25", "sum"),
+            )
+            .reset_index()
+        )
+        
+        yearly_all = d_year.merge(w_year, on="Year", how="outer").fillna(0.0).sort_values("Year")
+        
+        x = np.arange(len(yearly_all))
+        bw = 0.2
+        
+        plt.figure(figsize=(12, 6))
+        plt.bar(x - 1.5 * bw, yearly_all["Draft_PA_Poly"], width=bw, label="Draft PA (Poly)")
+        plt.bar(x - 0.5 * bw, yearly_all["Draft_PA_Pooled"], width=bw, label="Draft PA (Pooled)")
+        plt.bar(x + 0.5 * bw, yearly_all["Waiver_PA_Q25"], width=bw, label="Waiver PA (Q25 baseline)")
+        plt.bar(x + 1.5 * bw, yearly_all["Waiver_PA_Avg"], width=bw, label="Waiver PA (Avg baseline)")
+        
+        plt.axhline(0, linestyle="--", color="gray", alpha=0.6)
+        plt.xticks(x, yearly_all["Year"])
+        plt.ylabel("Total Points Added Over Expected")
+        plt.title("Yearly Total Points Added: Draft vs Waiver by Baseline")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+        
+        return yearly_all
+    
+    # ==================== START/SIT VISUALIZATION METHODS ====================
+    
+    def plot_startsit_by_year(
+        self,
+        startsit_weekly_clean: pd.DataFrame
+    ) -> pd.DataFrame:
+        """
+        Plot average Start/Sit points added by year.
+        
+        Args:
+            startsit_weekly_clean: Clean start/sit weekly data
+        
+        Returns:
+            Summary DataFrame
+        """
+        s = startsit_weekly_clean.copy()
+        if "StartSit_PA" not in s.columns:
+            raise ValueError("startsit_weekly_clean missing StartSit_PA.")
+        
+        s["Year"] = pd.to_numeric(s["Year"], errors="coerce").astype(int)
+        
+        summary_ss_year = (
+            s.groupby("Year", dropna=False)
+            .agg(
+                TeamWeeks=("StartSit_PA", "size"),
+                Avg_StartSit_PA=("StartSit_PA", "mean"),
+                Total_StartSit_PA=("StartSit_PA", "sum"),
+            )
+            .reset_index()
+            .sort_values("Year")
+        )
+        
+        x = np.arange(len(summary_ss_year))
+        plt.figure(figsize=(10, 5))
+        plt.bar(x, summary_ss_year["Avg_StartSit_PA"], color="#54A24B", alpha=0.8)
+        plt.axhline(0, linestyle="--", color="gray", alpha=0.6)
+        plt.xticks(x, summary_ss_year["Year"])
+        plt.ylabel("Average Start/Sit Points Added vs Projected-Optimal (per complete team-week)")
+        plt.title("Start/Sit Decision Quality by Year (Projected Baseline, Complete Weeks)")
+        for i, r in summary_ss_year.iterrows():
+            plt.text(i, r["Avg_StartSit_PA"], f"n={int(r['TeamWeeks'])}", ha="center", va="bottom", fontsize=9)
+        plt.tight_layout()
+        plt.show()
+        
+        return summary_ss_year
+    
+    def plot_cumulative_draft_waiver_startsit(
+        self,
+        draft_scored: pd.DataFrame,
+        waiver_stints: pd.DataFrame,
+        optimal_selected: pd.DataFrame,
+        startsit_weekly_clean: pd.DataFrame,
+        waiver_baseline_value: float,
+        draft_points_col: str = "Points_Added_Poly",
+        manual_draft_only: bool = True,
+        season_end_week: int = 17,
+        ignore_weeks: Set[int] = None,
+        agg_mode: str = "mean_per_team_season"
+    ) -> None:
+        """
+        Plot cumulative points added: Draft + Waiver + Start/Sit.
+        
+        Args:
+            draft_scored: Scored draft data
+            waiver_stints: Waiver stints DataFrame
+            optimal_selected: Optimal lineup selections
+            startsit_weekly_clean: Clean start/sit weekly data
+            waiver_baseline_value: Baseline value for waiver points
+            draft_points_col: Column name for draft points
+            manual_draft_only: If True, only include manual draft picks
+            season_end_week: Last week of season
+            ignore_weeks: Set of weeks to ignore
+            agg_mode: Aggregation mode
+        """
+        if ignore_weeks is None:
+            ignore_weeks = {15}
+        
+        d = draft_scored.copy()
+        if manual_draft_only:
+            d = d[d["Is_Autodrafted"] == 0].copy()
+        d[draft_points_col] = pd.to_numeric(d[draft_points_col], errors="coerce").fillna(0.0)
+        draft_total = float(d[draft_points_col].sum())
+        team_seasons_n = d[["League_ID", "Year", "Team"]].drop_duplicates().shape[0]
+        
+        osel = optimal_selected.copy()
+        osel["Week"] = pd.to_numeric(osel["Week"], errors="coerce")
+        osel["WeekPoints"] = pd.to_numeric(osel["WeekPoints"], errors="coerce").fillna(0.0)
+        osel["SelectedOptimal"] = osel["SelectedOptimal"].fillna(False).astype(bool)
+        osel["ValidWeekPoints"] = np.where(osel["SelectedOptimal"], osel["WeekPoints"], 0.0)
+        
+        joined = waiver_stints.merge(
+            osel[["League_ID", "Year", "Team", "Week", "Player_norm", "ValidWeekPoints"]],
+            on=["League_ID", "Year", "Team", "Player_norm"],
+            how="left"
+        )
+        joined = joined[
+            joined["Week"].notna() &
+            (joined["Week"].astype(int) >= joined["Start_Week_For_Credit"].astype(int)) &
+            (joined["Week"].astype(int) <= joined["End_Week"].astype(int))
+        ].copy()
+        joined["Week"] = pd.to_numeric(joined["Week"], errors="coerce").astype(int)
+        joined = joined[(joined["Week"] >= 1) & (joined["Week"] <= season_end_week)].copy()
+        joined = joined[~joined["Week"].isin(ignore_weeks)].copy()
+        
+        waiver_valid_week = joined.groupby("Week", dropna=False)["ValidWeekPoints"].sum().reset_index(name="Waiver_ValidSum")
+        
+        exp_rows = []
+        for _, r in waiver_stints.iterrows():
+            s = int(r["Start_Week_For_Credit"])
+            e = int(r["End_Week"])
+            if e < s:
+                continue
+            s = max(1, s)
+            e = min(season_end_week, e)
+            if e < s:
+                continue
+            exp_rows.extend([wk for wk in range(s, e + 1) if wk not in ignore_weeks])
+        
+        active_stints_week = pd.Series(exp_rows, name="Week").value_counts().rename_axis("Week").reset_index(name="Active_StintWeeks")
+        waiver_week = active_stints_week.merge(waiver_valid_week, on="Week", how="left")
+        waiver_week["Waiver_ValidSum"] = waiver_week["Waiver_ValidSum"].fillna(0.0)
+        waiver_week["Waiver_PA"] = waiver_week["Waiver_ValidSum"] - waiver_baseline_value * waiver_week["Active_StintWeeks"]
+        
+        ss = startsit_weekly_clean.copy()
+        ss["Week"] = pd.to_numeric(ss["Week"], errors="coerce").astype(int)
+        ss = ss[(ss["Week"] >= 1) & (ss["Week"] <= season_end_week)].copy()
+        ss = ss[~ss["Week"].isin(ignore_weeks)].copy()
+        startsit_week = ss.groupby("Week", dropna=False)["StartSit_PA"].sum().reset_index()
+        
+        weeks = [0] + [wk for wk in range(1, season_end_week + 1) if wk not in ignore_weeks]
+        draft_weekly = pd.Series(0.0, index=weeks)
+        waiver_weekly = pd.Series(0.0, index=weeks)
+        startsit_weekly_series = pd.Series(0.0, index=weeks)
+        
+        draft_weekly.loc[0] = draft_total
+        for _, r in waiver_week.iterrows():
+            waiver_weekly.loc[int(r["Week"])] = float(r["Waiver_PA"])
+        for _, r in startsit_week.iterrows():
+            startsit_weekly_series.loc[int(r["Week"])] = float(r["StartSit_PA"])
+        
+        if agg_mode == "mean_per_team_season":
+            draft_weekly /= team_seasons_n
+            waiver_weekly /= team_seasons_n
+            startsit_weekly_series /= team_seasons_n
+        
+        cum_draft = draft_weekly.cumsum()
+        cum_waiver = waiver_weekly.cumsum()
+        cum_startsit = startsit_weekly_series.cumsum()
+        cum_total = cum_draft + cum_waiver + cum_startsit
+        
+        plt.figure(figsize=(12, 6))
+        plt.plot(cum_draft.index, cum_draft.values, label="Draft (cumulative)", linewidth=2, marker="o")
+        plt.plot(cum_waiver.index, cum_waiver.values, label="Waiver (cumulative)", linewidth=2, marker="s")
+        plt.plot(cum_startsit.index, cum_startsit.values, label="Start/Sit (cumulative)", linewidth=2, marker="^")
+        plt.plot(cum_total.index, cum_total.values, label="Total (cumulative)", linewidth=2, linestyle="--", marker="D")
+        plt.axhline(0, linestyle=":", color="gray", alpha=0.5)
+        plt.xlabel("Week")
+        plt.ylabel(f"Points Added Over Expected ({'per team-season' if agg_mode == 'mean_per_team_season' else 'total'})")
+        plt.title("Cumulative Points Added: Draft + Waiver + Start/Sit")
+        plt.legend()
+        plt.grid(alpha=0.2)
+        plt.tight_layout()
+        plt.show()
 
