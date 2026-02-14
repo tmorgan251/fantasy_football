@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 import seaborn as sns
-from collections import defaultdict
+from scipy import stats
 
 # Import normalize_player_name from draft_value_analyzer
 from src.analysis.draft_value_analyzer import DraftValueAnalyzer
@@ -26,7 +26,6 @@ class InjuryAnalyzer:
     Features:
     - Matches injuries to lineup data by player name and week
     - Calculates point differentials (actual - projected) for injured vs healthy players
-    - Tracks consecutive injury weeks with same type and status
     - Generates visualizations (heatmaps, distributions)
     """
     
@@ -140,6 +139,23 @@ class InjuryAnalyzer:
         injury_df['injury_type'] = injury_df['report_primary_injury'].copy()
         injury_df.loc[~injury_df['has_injury'], 'injury_type'] = 'None'
         injury_df.loc[injury_df['injury_type'].isna(), 'injury_type'] = 'None'
+        
+        # Normalize injury types: remove "Left", "Right", etc. to consolidate side-specific injuries
+        # e.g., "Left Ankle", "Right Ankle", "Ankle" → all become "Ankle"
+        def normalize_injury_type(injury_type):
+            """Remove side-specific prefixes to consolidate injury types."""
+            if pd.isna(injury_type) or injury_type == 'None':
+                return injury_type
+            injury_str = str(injury_type).strip()
+            # Remove common side prefixes (case-insensitive)
+            prefixes = ['left ', 'right ', 'l ', 'r ']
+            for prefix in prefixes:
+                if injury_str.lower().startswith(prefix):
+                    injury_str = injury_str[len(prefix):].strip()
+                    break
+            return injury_str
+        
+        injury_df['injury_type'] = injury_df['injury_type'].apply(normalize_injury_type)
         
         # Normalize player names for matching
         injury_df['player_norm'] = injury_df['full_name'].apply(
@@ -373,92 +389,6 @@ class InjuryAnalyzer:
         self.merged_df = merged
         return merged
     
-    def track_consecutive_injuries(self) -> pd.DataFrame:
-        """
-        Track consecutive weeks with the same injury type and status per player.
-        
-        Uses vectorized operations (shift()) instead of slow groupby().apply() to avoid
-        memory issues. Tracks injuries separately per player/league/year to prevent
-        cross-season counting.
-        
-        Returns:
-            DataFrame with consecutive_injury_weeks column added
-        """
-        if self.merged_df is None:
-            self.merge_injury_lineup_data()
-        
-        if self.verbose:
-            print("\nTracking consecutive injury weeks...")
-            import time
-            start_time = time.time()
-        
-        df = self.merged_df.copy()
-        # Sort by player, league, year, week to ensure chronological order
-        sort_cols = ['player_norm', 'League_ID', 'Year', 'Week'] if 'League_ID' in df.columns else ['player_norm', 'Year', 'Week']
-        df = df.sort_values(sort_cols).reset_index(drop=True)
-        
-        df['consecutive_injury_weeks'] = 0
-        
-        # Group by player, league, and year so we track injuries separately per context
-        group_cols = ['player_norm', 'League_ID', 'Year'] if 'League_ID' in df.columns else ['player_norm', 'Year']
-        df['_group_id'] = df.groupby(group_cols).ngroup()
-        df = df.sort_values(['_group_id', 'Week']).reset_index(drop=True)
-        
-        # Use shift() to look at previous week's data without expensive groupby operations
-        # This is much faster and uses less memory than copying groups
-        df['_prev_group'] = df['_group_id'].shift(1)
-        df['_prev_week'] = df['Week'].shift(1)
-        df['_prev_injury_type'] = df['injury_type'].shift(1)
-        df['_prev_injury_status'] = df['injury_status'].shift(1)
-        df['_prev_has_injury'] = df['has_injury'].shift(1)
-        
-        # Count consecutive weeks: increment if same injury continues, reset if new/different
-        consecutive_counts = []
-        current_count = 0
-        
-        for idx in df.index:
-            # Check if we moved to a new player/league/year or skipped a week
-            is_new_group = df.loc[idx, '_group_id'] != df.loc[idx, '_prev_group']
-            is_consecutive_week = (
-                not is_new_group and 
-                pd.notna(df.loc[idx, '_prev_week']) and
-                df.loc[idx, 'Week'] == df.loc[idx, '_prev_week'] + 1
-            )
-            
-            if is_new_group or not is_consecutive_week:
-                current_count = 0  # Reset counter
-            
-            if df.loc[idx, 'has_injury']:
-                # If previous week had same injury type/status and weeks are consecutive, increment
-                # Otherwise, start counting from 1 (new injury)
-                if (is_consecutive_week and 
-                    df.loc[idx, '_prev_has_injury'] and
-                    df.loc[idx, 'injury_type'] == df.loc[idx, '_prev_injury_type'] and
-                    df.loc[idx, 'injury_status'] == df.loc[idx, '_prev_injury_status'] and
-                    df.loc[idx, 'injury_type'] != 'None'):
-                    current_count += 1
-                else:
-                    current_count = 1
-                consecutive_counts.append(current_count)
-            else:
-                consecutive_counts.append(0)  # Healthy week = 0 consecutive
-        
-        df['consecutive_injury_weeks'] = consecutive_counts
-        df = df.drop(columns=['_group_id', '_prev_group', '_prev_week', 
-                             '_prev_injury_type', '_prev_injury_status', '_prev_has_injury'])
-        
-        if self.verbose:
-            elapsed = time.time() - start_time
-            injured_players = df[df['has_injury']]
-            if len(injured_players) > 0:
-                max_consecutive = injured_players['consecutive_injury_weeks'].max()
-                print(f"  ✓ Tracked consecutive injuries in {elapsed:.1f} seconds")
-                print(f"  Max consecutive injury weeks: {max_consecutive}")
-                print(f"  Players with 2+ consecutive weeks: {(injured_players['consecutive_injury_weeks'] >= 2).sum():,}")
-        
-        self.merged_df = df
-        return df
-    
     def prepare_analysis_data(self) -> pd.DataFrame:
         """
         Prepare analysis dataset with impact metrics.
@@ -473,14 +403,14 @@ class InjuryAnalyzer:
             start_time = time.time()
         
         if self.merged_df is None:
-            self.track_consecutive_injuries()
+            self.merge_injury_lineup_data()
         
         df = self.merged_df.copy()
         
         # Filter to relevant columns for analysis
         analysis_cols = [
             'player_norm', 'Year', 'Week', 'position', 'has_injury',
-            'injury_status', 'injury_type', 'consecutive_injury_weeks',
+            'injury_status', 'injury_type',
             'Points', 'Projected_Points', 'point_differential',
             'baseline_avg', 'baseline_std', 'n_weeks'
         ]
@@ -503,8 +433,7 @@ class InjuryAnalyzer:
         Compute aggregated statistics using fast vectorized groupby operations.
         
         Replaces slow nested loops with single groupby().agg() call. Groups by
-        injury type, status, position, and consecutive weeks to calculate means,
-        counts, and standard deviations.
+        injury type, status, and position to calculate means, counts, and standard deviations.
         
         Args:
             analysis_df: Optional pre-prepared DataFrame. If None, prepares it automatically.
@@ -589,7 +518,7 @@ class InjuryAnalyzer:
         
         return agg_stats_df, analysis_df
     
-    def plot_heatmap_type_position(self, save_path: Optional[str] = None, min_population: int = 30) -> plt.Figure:
+    def plot_heatmap_type_position(self, save_path: Optional[str] = None, min_population: int = 30, show_sample_sizes: bool = True) -> plt.Figure:
         """
         Create heatmap: Injury Type (rows) × Position (columns), color = avg point differential.
         
@@ -599,12 +528,13 @@ class InjuryAnalyzer:
         Args:
             save_path: Optional path to save figure
             min_population: Minimum number of observations required per cell (default: 30)
+            show_sample_sizes: If True, show sample size (n=X) in each cell (default: True)
         
         Returns:
             matplotlib Figure
         """
         if self.merged_df is None:
-            self.track_consecutive_injuries()
+            self.merge_injury_lineup_data()
         
         df = self.merged_df[self.merged_df['has_injury']].copy()
         
@@ -619,23 +549,53 @@ class InjuryAnalyzer:
         
         # Pivot to create heatmap matrix
         heatmap_pivot = heatmap_data.pivot(index='injury_type', columns='position', values='point_differential')
+        count_pivot = heatmap_data.pivot(index='injury_type', columns='position', values='count')
         
         # Filter out 'None' injury type
         if 'None' in heatmap_pivot.index:
             heatmap_pivot = heatmap_pivot.drop('None')
+            if 'None' in count_pivot.index:
+                count_pivot = count_pivot.drop('None')
+        
+        # Sort rows by average impact (most negative to most positive) for better pattern visibility
+        row_means = heatmap_pivot.mean(axis=1).sort_values()
+        heatmap_pivot = heatmap_pivot.reindex(row_means.index)
+        count_pivot = count_pivot.reindex(row_means.index)
         
         # Create figure
         fig, ax = plt.subplots(figsize=(12, max(8, len(heatmap_pivot) * 0.5)))
+        
+        # Format annotations: value (n=count) if show_sample_sizes, otherwise just value
+        if show_sample_sizes:
+            annot_text = heatmap_pivot.copy().astype(str)
+            for idx in heatmap_pivot.index:
+                for col in heatmap_pivot.columns:
+                    val = heatmap_pivot.loc[idx, col]
+                    cnt = count_pivot.loc[idx, col] if idx in count_pivot.index and col in count_pivot.columns else None
+                    if pd.notna(val) and pd.notna(cnt):
+                        annot_text.loc[idx, col] = f'{val:.1f}\n(n={int(cnt)})'
+                    elif pd.notna(val):
+                        annot_text.loc[idx, col] = f'{val:.1f}'
+                    else:
+                        annot_text.loc[idx, col] = ''
+            annot_kws = {'fontsize': 8}
+            fmt = ''
+        else:
+            annot_text = True
+            annot_kws = {}
+            fmt = '.1f'
+        
         sns.heatmap(
             heatmap_pivot,
-            annot=True,
-            fmt='.1f',
-            cmap='RdYlGn_r',
+            annot=annot_text,
+            fmt=fmt,
+            cmap='RdYlGn',  # Red (negative/underperformance) to Green (positive/overperformance)
             center=0,
             vmin=-10,
             vmax=10,
             cbar_kws={'label': 'Avg Point Differential (Actual - Projected)'},
-            ax=ax
+            ax=ax,
+            annot_kws=annot_kws
         )
         ax.set_title('Injury Impact: Type × Position\n(Average Point Differential)', fontsize=14, fontweight='bold')
         ax.set_xlabel('Position', fontsize=12)
@@ -647,7 +607,7 @@ class InjuryAnalyzer:
         
         return fig
     
-    def plot_heatmap_type_status(self, save_path: Optional[str] = None, min_population: int = 30) -> plt.Figure:
+    def plot_heatmap_type_status(self, save_path: Optional[str] = None, min_population: int = 30, show_sample_sizes: bool = True) -> plt.Figure:
         """
         Create heatmap: Injury Type (rows) × Status (columns), color = avg point differential.
         
@@ -657,12 +617,13 @@ class InjuryAnalyzer:
         Args:
             save_path: Optional path to save figure
             min_population: Minimum number of observations required per cell (default: 30)
+            show_sample_sizes: If True, show sample size (n=X) in each cell (default: True)
         
         Returns:
             matplotlib Figure
         """
         if self.merged_df is None:
-            self.track_consecutive_injuries()
+            self.merge_injury_lineup_data()
         
         df = self.merged_df[self.merged_df['has_injury']].copy()
         
@@ -676,23 +637,53 @@ class InjuryAnalyzer:
         
         # Pivot to create heatmap matrix
         heatmap_pivot = heatmap_data.pivot(index='injury_type', columns='injury_status', values='point_differential')
+        count_pivot = heatmap_data.pivot(index='injury_type', columns='injury_status', values='count')
         
         # Filter out 'None' injury type
         if 'None' in heatmap_pivot.index:
             heatmap_pivot = heatmap_pivot.drop('None')
+            if 'None' in count_pivot.index:
+                count_pivot = count_pivot.drop('None')
+        
+        # Sort rows by average impact (most negative to most positive) for better pattern visibility
+        row_means = heatmap_pivot.mean(axis=1).sort_values()
+        heatmap_pivot = heatmap_pivot.reindex(row_means.index)
+        count_pivot = count_pivot.reindex(row_means.index)
         
         # Create figure
         fig, ax = plt.subplots(figsize=(10, max(8, len(heatmap_pivot) * 0.5)))
+        
+        # Format annotations
+        if show_sample_sizes:
+            annot_text = heatmap_pivot.copy().astype(str)
+            for idx in heatmap_pivot.index:
+                for col in heatmap_pivot.columns:
+                    val = heatmap_pivot.loc[idx, col]
+                    cnt = count_pivot.loc[idx, col] if idx in count_pivot.index and col in count_pivot.columns else None
+                    if pd.notna(val) and pd.notna(cnt):
+                        annot_text.loc[idx, col] = f'{val:.1f}\n(n={int(cnt)})'
+                    elif pd.notna(val):
+                        annot_text.loc[idx, col] = f'{val:.1f}'
+                    else:
+                        annot_text.loc[idx, col] = ''
+            annot_kws = {'fontsize': 8}
+            fmt = ''
+        else:
+            annot_text = True
+            annot_kws = {}
+            fmt = '.1f'
+        
         sns.heatmap(
             heatmap_pivot,
-            annot=True,
-            fmt='.1f',
-            cmap='RdYlGn_r',
+            annot=annot_text,
+            fmt=fmt,
+            cmap='RdYlGn',  # Red (negative/underperformance) to Green (positive/overperformance)
             center=0,
             vmin=-10,
             vmax=10,
             cbar_kws={'label': 'Avg Point Differential (Actual - Projected)'},
-            ax=ax
+            ax=ax,
+            annot_kws=annot_kws
         )
         ax.set_title('Injury Impact: Type × Status\n(Average Point Differential)', fontsize=14, fontweight='bold')
         ax.set_xlabel('Injury Status', fontsize=12)
@@ -704,37 +695,77 @@ class InjuryAnalyzer:
         
         return fig
     
-    def plot_heatmap_position_status(self, save_path: Optional[str] = None) -> plt.Figure:
+    def plot_heatmap_position_status(self, save_path: Optional[str] = None, min_population: int = 30, show_sample_sizes: bool = True) -> plt.Figure:
         """
         Create heatmap: Position (rows) × Status (columns), color = avg point differential.
         
+        Only includes position/status combinations with sufficient data (min_population)
+        to ensure statistical reliability.
+        
         Args:
             save_path: Optional path to save figure
+            min_population: Minimum number of observations required per cell (default: 30)
+            show_sample_sizes: If True, show sample size (n=X) in each cell (default: True)
         
         Returns:
             matplotlib Figure
         """
         if self.merged_df is None:
-            self.track_consecutive_injuries()
+            self.merge_injury_lineup_data()
         
         df = self.merged_df[self.merged_df['has_injury']].copy()
         
-        # Aggregate by position and status
+        # Count observations per position/status combination
+        counts = df.groupby(['position', 'injury_status']).size().reset_index(name='count')
         heatmap_data = df.groupby(['position', 'injury_status'])['point_differential'].mean().reset_index()
+        
+        # Filter to only include combinations with sufficient data
+        heatmap_data = heatmap_data.merge(counts, on=['position', 'injury_status'])
+        heatmap_data = heatmap_data[heatmap_data['count'] >= min_population]
+        
+        # Pivot to create heatmap matrix
         heatmap_pivot = heatmap_data.pivot(index='position', columns='injury_status', values='point_differential')
+        count_pivot = heatmap_data.pivot(index='position', columns='injury_status', values='count')
+        
+        # Sort rows by average impact (most negative to most positive)
+        row_means = heatmap_pivot.mean(axis=1).sort_values()
+        heatmap_pivot = heatmap_pivot.reindex(row_means.index)
+        count_pivot = count_pivot.reindex(row_means.index)
         
         # Create figure
         fig, ax = plt.subplots(figsize=(10, 6))
+        
+        # Format annotations
+        if show_sample_sizes:
+            annot_text = heatmap_pivot.copy().astype(str)
+            for idx in heatmap_pivot.index:
+                for col in heatmap_pivot.columns:
+                    val = heatmap_pivot.loc[idx, col]
+                    cnt = count_pivot.loc[idx, col] if idx in count_pivot.index and col in count_pivot.columns else None
+                    if pd.notna(val) and pd.notna(cnt):
+                        annot_text.loc[idx, col] = f'{val:.1f}\n(n={int(cnt)})'
+                    elif pd.notna(val):
+                        annot_text.loc[idx, col] = f'{val:.1f}'
+                    else:
+                        annot_text.loc[idx, col] = ''
+            annot_kws = {'fontsize': 8}
+            fmt = ''
+        else:
+            annot_text = True
+            annot_kws = {}
+            fmt = '.1f'
+        
         sns.heatmap(
             heatmap_pivot,
-            annot=True,
-            fmt='.1f',
-            cmap='RdYlGn_r',
+            annot=annot_text,
+            fmt=fmt,
+            cmap='RdYlGn',  # Red (negative/underperformance) to Green (positive/overperformance)
             center=0,
             vmin=-10,
             vmax=10,
             cbar_kws={'label': 'Avg Point Differential (Actual - Projected)'},
-            ax=ax
+            ax=ax,
+            annot_kws=annot_kws
         )
         ax.set_title('Injury Impact: Position × Status\n(Average Point Differential)', fontsize=14, fontweight='bold')
         ax.set_xlabel('Injury Status', fontsize=12)
@@ -757,7 +788,7 @@ class InjuryAnalyzer:
             matplotlib Figure
         """
         if self.merged_df is None:
-            self.track_consecutive_injuries()
+            self.merge_injury_lineup_data()
         
         df = self.merged_df.copy()
         
@@ -769,13 +800,36 @@ class InjuryAnalyzer:
         injured = df[df['has_injury']]['point_differential'].dropna()
         healthy = df[~df['has_injury']]['point_differential'].dropna()
         
-        ax1.hist(healthy, bins=50, alpha=0.6, label='Healthy', color='green', density=True)
-        ax1.hist(injured, bins=50, alpha=0.6, label='Injured', color='red', density=True)
+        ax1.hist(healthy, bins=50, alpha=0.6, label=f'Healthy (n={len(healthy):,})', color='green', density=True)
+        ax1.hist(injured, bins=50, alpha=0.6, label=f'Injured (n={len(injured):,})', color='red', density=True)
         ax1.axvline(x=0, color='black', linestyle='--', alpha=0.5)
+        # Add mean lines and confidence intervals for reference
+        healthy_mean = healthy.mean()
+        healthy_median = healthy.median()
+        healthy_std = healthy.std()
+        healthy_se = healthy_std / np.sqrt(len(healthy)) if len(healthy) > 0 else 0
+        healthy_ci = stats.t.interval(0.95, len(healthy)-1, loc=healthy_mean, scale=healthy_se) if len(healthy) > 1 else (healthy_mean, healthy_mean)
+        
+        injured_mean = injured.mean()
+        injured_median = injured.median()
+        injured_std = injured.std()
+        injured_se = injured_std / np.sqrt(len(injured)) if len(injured) > 0 else 0
+        injured_ci = stats.t.interval(0.95, len(injured)-1, loc=injured_mean, scale=injured_se) if len(injured) > 1 else (injured_mean, injured_mean)
+        
+        # Add confidence interval bands
+        ax1.axvspan(healthy_ci[0], healthy_ci[1], color='green', alpha=0.15, label=f'Healthy 95% CI: [{healthy_ci[0]:.2f}, {healthy_ci[1]:.2f}]')
+        ax1.axvspan(injured_ci[0], injured_ci[1], color='red', alpha=0.15, label=f'Injured 95% CI: [{injured_ci[0]:.2f}, {injured_ci[1]:.2f}]')
+        
+        # Add mean and median lines
+        ax1.axvline(x=healthy_mean, color='green', linestyle=':', linewidth=2, alpha=0.8)
+        ax1.axvline(x=healthy_median, color='green', linestyle='--', linewidth=1.5, alpha=0.6)
+        ax1.axvline(x=injured_mean, color='red', linestyle=':', linewidth=2, alpha=0.8)
+        ax1.axvline(x=injured_median, color='red', linestyle='--', linewidth=1.5, alpha=0.6)
         ax1.set_xlabel('Point Differential (Actual - Projected)', fontsize=11)
         ax1.set_ylabel('Density', fontsize=11)
-        ax1.set_title('Overall: Injured vs Healthy', fontsize=12, fontweight='bold')
-        ax1.legend()
+        title = f'Overall: Injured vs Healthy\nMean: Healthy={healthy_mean:.2f}, Injured={injured_mean:.2f}'
+        ax1.set_title(title, fontsize=12, fontweight='bold')
+        ax1.legend(fontsize=9)
         ax1.grid(True, alpha=0.3)
         
         # 2. By injury status
@@ -785,12 +839,16 @@ class InjuryAnalyzer:
         for status, color in zip(statuses, colors):
             status_data = df[df['injury_status'] == status]['point_differential'].dropna()
             if len(status_data) > 0:
-                ax2.hist(status_data, bins=30, alpha=0.5, label=status, color=color, density=True)
+                mean_val = status_data.mean()
+                ax2.hist(status_data, bins=30, alpha=0.5, 
+                        label=f'{status} (n={len(status_data):,}, μ={mean_val:.2f})', 
+                        color=color, density=True)
+                ax2.axvline(x=mean_val, color=color, linestyle=':', linewidth=2, alpha=0.7)
         ax2.axvline(x=0, color='black', linestyle='--', alpha=0.5)
         ax2.set_xlabel('Point Differential (Actual - Projected)', fontsize=11)
         ax2.set_ylabel('Density', fontsize=11)
         ax2.set_title('By Injury Status', fontsize=12, fontweight='bold')
-        ax2.legend()
+        ax2.legend(fontsize=8)
         ax2.grid(True, alpha=0.3)
         
         # 3. By position (top 4 positions)
@@ -799,12 +857,16 @@ class InjuryAnalyzer:
         for pos in top_positions:
             pos_data = df[(df['has_injury']) & (df['position'] == pos)]['point_differential'].dropna()
             if len(pos_data) > 0:
-                ax3.hist(pos_data, bins=30, alpha=0.5, label=pos, density=True)
+                mean_val = pos_data.mean()
+                ax3.hist(pos_data, bins=30, alpha=0.5, 
+                        label=f'{pos} (n={len(pos_data):,}, μ={mean_val:.2f})', 
+                        density=True)
+                ax3.axvline(x=mean_val, linestyle=':', linewidth=1.5, alpha=0.6)
         ax3.axvline(x=0, color='black', linestyle='--', alpha=0.5)
         ax3.set_xlabel('Point Differential (Actual - Projected)', fontsize=11)
         ax3.set_ylabel('Density', fontsize=11)
         ax3.set_title('By Position (Injured Only)', fontsize=12, fontweight='bold')
-        ax3.legend()
+        ax3.legend(fontsize=8)
         ax3.grid(True, alpha=0.3)
         
         # 4. Box plot comparison
@@ -818,7 +880,16 @@ class InjuryAnalyzer:
                 box_labels.append(status)
         
         if box_data:
-            ax4.boxplot(box_data, labels=box_labels)
+            # Add sample sizes to labels
+            labels_with_n = []
+            for i, (label, data) in enumerate(zip(box_labels, box_data)):
+                labels_with_n.append(f"{label}\n(n={len(data):,})")
+            
+            bp = ax4.boxplot(box_data, labels=labels_with_n, patch_artist=True)
+            # Color boxes: green for healthy, red shades for injured
+            colors = ['lightgreen' if 'No Injury' in label else 'lightcoral' for label in box_labels]
+            for patch, color in zip(bp['boxes'], colors):
+                patch.set_facecolor(color)
             ax4.axhline(y=0, color='black', linestyle='--', alpha=0.5)
             ax4.set_ylabel('Point Differential (Actual - Projected)', fontsize=11)
             ax4.set_title('Box Plot Comparison', fontsize=12, fontweight='bold')
@@ -847,8 +918,7 @@ class InjuryAnalyzer:
         2. analyzer.load_lineup_data()
         3. analyzer.calculate_player_baselines()
         4. analyzer.merge_injury_lineup_data()
-        5. analyzer.track_consecutive_injuries()
-        6. agg_stats, individual = analyzer.analyze_injury_impact()
+        5. agg_stats, individual = analyzer.analyze_injury_impact()
         
         Args:
             save_results: If True, save results to CSV files
@@ -866,28 +936,23 @@ class InjuryAnalyzer:
         
         # Step 1: Load data
         if self.verbose:
-            print("\n[Step 1/5] Loading data...")
+            print("\n[Step 1/4] Loading data...")
         self.load_injury_data()
         self.load_lineup_data()
         
         # Step 2: Calculate baselines (now optimized - much faster!)
         if self.verbose:
-            print("\n[Step 2/5] Calculating player baselines...")
+            print("\n[Step 2/4] Calculating player baselines...")
         self.calculate_player_baselines()
         
         # Step 3: Merge data
         if self.verbose:
-            print("\n[Step 3/5] Merging injury and lineup data...")
+            print("\n[Step 3/4] Merging injury and lineup data...")
         self.merge_injury_lineup_data()
         
-        # Step 4: Track consecutive injuries (now optimized)
+        # Step 4: Analyze impact
         if self.verbose:
-            print("\n[Step 4/5] Tracking consecutive injury weeks...")
-        self.track_consecutive_injuries()
-        
-        # Step 5: Analyze impact
-        if self.verbose:
-            print("\n[Step 5/5] Analyzing injury impact...")
+            print("\n[Step 4/4] Analyzing injury impact...")
         agg_stats, individual_records = self.analyze_injury_impact()
         
         # Save results if requested
@@ -918,4 +983,92 @@ class InjuryAnalyzer:
             print("="*70)
         
         return agg_stats, individual_records
+    
+    def plot_top_injury_impacts(
+        self,
+        agg_stats: Optional[pd.DataFrame] = None,
+        top_n: int = 10,
+        save_path: Optional[str] = None
+    ) -> plt.Figure:
+        """
+        Create bar chart showing top N most impactful injury combinations.
+        
+        Shows both best (positive impact) and worst (negative impact) combinations
+        to highlight which injuries help vs hurt performance.
+        
+        Args:
+            agg_stats: Aggregated statistics DataFrame (uses computed if None)
+            top_n: Number of top combinations to show (default: 10)
+            save_path: Optional path to save figure
+        
+        Returns:
+            matplotlib Figure
+        """
+        if agg_stats is None:
+            if self.merged_df is None:
+                self.merge_injury_lineup_data()
+            _, agg_stats = self.analyze_injury_impact()
+        
+        if agg_stats.empty:
+            raise ValueError("No aggregated statistics available. Run analysis first.")
+        
+        # Create combination label
+        agg_stats['combination'] = (
+            agg_stats['injury_type'].astype(str) + ' × ' + 
+            agg_stats['position'].astype(str) + ' × ' + 
+            agg_stats['injury_status'].astype(str)
+        )
+        
+        # Sort by impact
+        agg_stats_sorted = agg_stats.sort_values('avg_point_differential', ascending=False)
+        
+        # Get top N best and worst
+        top_best = agg_stats_sorted.head(top_n)
+        top_worst = agg_stats_sorted.tail(top_n)
+        
+        # Create figure with two subplots
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+        
+        # Top N best (positive impact)
+        colors_best = ['green' if x > 0 else 'gray' for x in top_best['avg_point_differential']]
+        bars1 = ax1.barh(range(len(top_best)), top_best['avg_point_differential'], color=colors_best, alpha=0.7)
+        ax1.set_yticks(range(len(top_best)))
+        ax1.set_yticklabels([f"{row['combination']}\n(n={int(row['n_weeks'])})" 
+                             for _, row in top_best.iterrows()], fontsize=9)
+        ax1.axvline(x=0, color='black', linestyle='--', alpha=0.5)
+        ax1.set_xlabel('Avg Point Differential (Actual - Projected)', fontsize=11)
+        ax1.set_title(f'Top {top_n} Best Performing\nInjury Combinations', fontsize=12, fontweight='bold')
+        ax1.grid(True, alpha=0.3, axis='x')
+        
+        # Add value labels on bars
+        for i, (idx, row) in enumerate(top_best.iterrows()):
+            val = row['avg_point_differential']
+            ax1.text(val + (0.3 if val >= 0 else -0.3), i, f'{val:.2f}', 
+                    va='center', ha='left' if val >= 0 else 'right', fontsize=8)
+        
+        # Top N worst (negative impact)
+        colors_worst = ['red' if x < 0 else 'gray' for x in top_worst['avg_point_differential']]
+        bars2 = ax2.barh(range(len(top_worst)), top_worst['avg_point_differential'], color=colors_worst, alpha=0.7)
+        ax2.set_yticks(range(len(top_worst)))
+        ax2.set_yticklabels([f"{row['combination']}\n(n={int(row['n_weeks'])})" 
+                             for _, row in top_worst.iterrows()], fontsize=9)
+        ax2.axvline(x=0, color='black', linestyle='--', alpha=0.5)
+        ax2.set_xlabel('Avg Point Differential (Actual - Projected)', fontsize=11)
+        ax2.set_title(f'Top {top_n} Worst Performing\nInjury Combinations', fontsize=12, fontweight='bold')
+        ax2.grid(True, alpha=0.3, axis='x')
+        
+        # Add value labels on bars
+        for i, (idx, row) in enumerate(top_worst.iterrows()):
+            val = row['avg_point_differential']
+            ax2.text(val + (0.3 if val >= 0 else -0.3), i, f'{val:.2f}', 
+                    va='center', ha='left' if val >= 0 else 'right', fontsize=8)
+        
+        fig.suptitle('Most Impactful Injury Combinations\n(Top and Bottom Performers)', 
+                     fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        
+        return fig
 
