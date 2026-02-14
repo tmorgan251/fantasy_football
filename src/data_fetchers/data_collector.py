@@ -142,10 +142,10 @@ class FantasyDataCollector:
             # Extract weekly lineup and transaction data (batched for performance)
             self._get_seasonal_data(league, league_id, year, batch_writes=True)
 
-            print(f"✓ {league_id}/{year} Saved: Draft({len(draft_rows)})")
+            print(f"{league_id}/{year} Saved: Draft({len(draft_rows)})")
 
         except Exception as e:
-            print(f"✗ Failed League {league_id}/{year}: {e}")
+            print(f"Failed League {league_id}/{year}: {e}")
 
     def _get_draft_data(self, league, lid, year):
         """
@@ -446,20 +446,23 @@ def collect_leagues_parallel(
         succeeded = 0
         failed = 0
         
+        # Had runtime issues with taking forever to grab data, so I parallelized the process.
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit tasks to the executor
             future_to_task = {executor.submit(process_league_year, task): task for task in tasks}
             
+            # Process results as they complete
             for future in as_completed(future_to_task):
                 lid, yr, success, error = future.result()
                 completed += 1
                 if success:
                     succeeded += 1
                     if verbose:
-                        print(f"  [{completed}/{len(tasks)}] ✓ {lid}/{yr}")
+                        print(f"  [{completed}/{len(tasks)}] {lid}/{yr}")
                 else:
                     failed += 1
                     if verbose:
-                        print(f"  [{completed}/{len(tasks)}] ✗ {lid}/{yr}: {error}")
+                        print(f"  [{completed}/{len(tasks)}] {lid}/{yr}: {error}")
         
         results_by_year[year] = {'succeeded': succeeded, 'failed': failed}
         total_succeeded += succeeded
@@ -556,11 +559,11 @@ def collect_injury_data(years, output_dir=None):
             records = len(injuries_df)
             total_records += records
             
-            print(f"  ✓ Saved {records:,} records to {output_path} ({elapsed:.1f}s)")
+            print(f"  Saved {records:,} records to {output_path} ({elapsed:.1f}s)")
             files_saved.append(output_path)
             
         except Exception as e:
-            print(f"  ✗ Failed to fetch injury data for {year}: {e}")
+            print(f"  Failed to fetch injury data for {year}: {e}")
             continue
     
     print(f"\n{'='*70}")
